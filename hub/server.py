@@ -40,6 +40,12 @@ import logbus, feedlog, cait_feed
 
 HTTP_PORT = int(os.environ.get("HUB_HTTP_PORT", "8770"))
 WS_PORT = int(os.environ.get("HUB_WS_PORT", "8765"))
+# Listen address. Upstream binds 127.0.0.1 and that stays the default: a chart that
+# is only ever opened on this machine should not be on the network. A container is
+# the exception — its own loopback is unreachable from outside it — so HUB_BIND
+# exists for that case and nothing else. Widening it puts an unauthenticated page
+# on whatever interface you name; put it behind a private network, not the internet.
+BIND_HOST = os.environ.get("HUB_BIND", "127.0.0.1").strip() or "127.0.0.1"
 LOCAL_MT5 = os.environ.get("LOCAL_MT5", "0") == "1"
 MT5_TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe")
 REMOTE_SSH_HOST = os.environ.get("REMOTE_MT5_SSH_HOST", "").strip()   # an alias from your ~/.ssh/config; empty = off
@@ -1078,7 +1084,7 @@ class HubHTTPServer(ThreadingHTTPServer):
 
 def run_http():
     h = functools.partial(LabHandler, directory=HERE)
-    HubHTTPServer(("127.0.0.1", HTTP_PORT), h).serve_forever()
+    HubHTTPServer((BIND_HOST, HTTP_PORT), h).serve_forever()
 
 async def main():
     logbus.install(lambda: CLOCK_OFFSET_MS)
@@ -1094,7 +1100,7 @@ async def main():
         threading.Thread(target=cait_feed.symbols_loop, daemon=True).start()
     feedlog.start(FEED_HEALTH, ARM_PORT if REMOTE_ON else None, feed_status)
     print(f"TradeX: open http://localhost:{HTTP_PORT}/hub.html  (data on ws://localhost:{WS_PORT})", flush=True)
-    async with websockets.serve(handler, "127.0.0.1", WS_PORT, max_size=None):
+    async with websockets.serve(handler, BIND_HOST, WS_PORT, max_size=None):
         await asyncio.Future()
 
 if __name__ == "__main__":

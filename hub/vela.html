@@ -10,11 +10,25 @@
      Keep the menu layer above the chart; the layer itself lets clicks through where it has no menu. */
   .vela-ui-layer { z-index: 30; pointer-events: none; }
   .vela-ui-layer > * { pointer-events: auto; }
+  #ovgroup{display:none;gap:6px;align-items:center;margin-left:6px}
+  #ovgroup.show{display:inline-flex}
+  #ovinfo{color:#8fa3b4;font-size:12px}
+  #ovinfo.warn{color:#d9a441}
 </style></head><body>
 <div id="top"><b>TradeX</b> <span style="color:#93a2af">Vela engine</span>
   <select id="layout"><option value="">1 chart</option><option value="2h">2 side by side</option><option value="2v">2 stacked</option><option value="4">4 charts</option><option value="8">8 charts</option></select>
   <span style="color:#93a2af">Tips: type a letter for symbol search, a digit for timeframe, ? for all shortcuts. Drag pane borders to resize.</span>
-  <button id="auto">Code trendline</button></div>
+  <button id="auto">Code trendline</button>
+  <span id="ovgroup">
+    <select id="ovmode" title="Overlay real orders or a backtest's trades on the candles">
+      <option value="off">No overlay</option>
+      <option value="orders">Orders (real)</option>
+      <option value="backtest">Backtest trades</option>
+    </select>
+    <select id="ovtable" title="Which backtest table to read"></select>
+    <select id="ovstrategy" title="Strategy label within that table"></select>
+    <span id="ovinfo"></span>
+  </span></div>
 <div id="chart"></div>
 <script src="vela.bundle.js"></script>
 <script src="theme.js"></script>
@@ -48,7 +62,7 @@ const provider = {
       to = out[0].time - 1;
     }
     if (range.from) out = out.filter((b) => b.time >= range.from);
-    if (!range.to) { lastBars = out; setTimeout(applyTheme, 400); }  // the volume indicator mounts with the data: colour it then
+    if (!range.to) { lastBars = out; setTimeout(applyTheme, 400); setTimeout(() => { try { ovSync(); ovPaint(); } catch (e) {} }, 600); }  // the volume indicator mounts with the data: colour it then
     return out;
   },
   subscribe(ticker, timeframe, onBar) {
@@ -152,6 +166,7 @@ function build(layout) {
   // Floating favourites bar for starred drawing tools (drawing_favbar.js).
   try { TradeXFavBar.mount(ws, host); } catch (e) { console.warn("favourites bar", e); }
   try { TradeXAutoFit.mount(ws); } catch (e) { console.warn("order-flow auto fit", e); }
+  try { ovInit(); } catch (e) { console.warn("CAIT overlay ui", e); }
   // Colour every chart once its first history is in (the volume indicator mounts with the data).
   setTimeout(applyTheme, 1500);
   // Tell the TradeX shell when the symbol or timeframe is changed inside Vela.
@@ -183,6 +198,149 @@ function addCodeTrendline() {
   return ws.chart.drawings.add("trendline", { paneId: "price", anchors: [{ time: a.time, price: a.low }, { time: c.time, price: c.low }] });
 }
 document.getElementById("auto").onclick = addCodeTrendline;
+
+// ---- CAIT overlays ---------------------------------------------------------
+// Vela has no marker series, so each marker is a single-anchor drawing. That
+// means we must track and remove them ourselves: they are real drawings on the
+// chart, not a layer that can be swapped wholesale.
+//
+// Orders and backtest trades stay visually distinct. An order is what a venue
+// did; a backtest marker is what a model says would have happened.
+let ovMode = "off", ovTable = "donchian", ovStrategy = "", ovHandles = [], ovInfoLast = null, ovBusy = false;
+// Tool names vary across Vela builds; the first that works is kept.
+const OV_UP_TOOLS = ["arrowmarkup", "arrow-up", "arrowup", "flagmark", "label"];
+const OV_DOWN_TOOLS = ["arrowmarkdown", "arrow-down", "arrowdown", "flagmark", "label"];
+let ovUpTool = null, ovDownTool = null;
+
+function ovAvailable() { return /^CAIT_/.test(String(window.LabDefaultSymbol || "")); }
+
+function ovAdd(tools, cached, anchor, color, text) {
+  const names = cached ? [cached] : tools;
+  for (const t of names) {
+    try {
+      const h = ws.chart.drawings.add(t, {
+        paneId: "price", anchors: [anchor],
+        properties: { color, backgroundColor: color, textColor: color, text },
+      });
+      if (h) return { handle: h, tool: t };
+    } catch (e) { /* try the next name */ }
+  }
+  return null;
+}
+
+function ovClear() {
+  for (const h of ovHandles) { try { h.remove ? h.remove() : ws.chart.drawings.remove(h); } catch (e) {} }
+  ovHandles = [];
+}
+
+// Why the last paint drew nothing. Vela gives no feedback when a drawing is
+// rejected, so without this a silent empty overlay is indistinguishable from
+// "there was nothing in the window" — which cost an hour the first time.
+let ovWhy = null;
+async function ovPaint() {
+  if (!ws || !ws.chart) { ovWhy = "no ws.chart"; return; }
+  ovClear();
+  ovShowInfo(0);
+  if (ovMode === "off") { ovWhy = "mode off"; return; }
+  if (!ovAvailable()) { ovWhy = "not a CAIT ticker"; return; }
+  if (!lastBars.length) { ovWhy = "no bars"; return; }
+  if (ovBusy) { ovWhy = "busy"; return; }
+  ovWhy = "running";
+  ovBusy = true;
+  try {
+    const sym = String(window.LabDefaultSymbol);
+    // Vela's bar.time is EPOCH MILLISECONDS (the provider multiplies TradeX's
+    // seconds by 1000), while the markers API speaks seconds. Mixing the two
+    // sent the server a timestamp in the year 57927.
+    const from = Math.floor(lastBars[0].time / 1000);
+    const to = Math.floor(lastBars[lastBars.length - 1].time / 1000) + 86400;
+    const q = new URLSearchParams({ symbol: sym, from, to, kind: ovMode === "orders" ? "orders" : "backtest" });
+    if (ovMode === "orders") q.set("status", "filled");
+    else { q.set("table", ovTable); if (ovStrategy) q.set("strategy", ovStrategy); }
+    const data = await fetch("/api/cait/markers?" + q).then((r) => r.json());
+    if (data.error || !data.markers) { ovWhy = "api: " + (data.error || "no markers"); return; }
+    ovInfoLast = { shown: data.markers.length, total: data.total || data.markers.length, sampled: !!data.sampled };
+
+    // Collapse per bar and side. Vela draws real objects, so an un-collapsed
+    // June of ETHUSD would add thousands of drawings and make the chart unusable.
+    // Snap in seconds; anchor in milliseconds.
+    const secs = lastBars.map((b) => Math.floor(b.time / 1000));
+    const snap = (t) => { let lo = 0, hi = secs.length - 1, best = -1;
+      while (lo <= hi) { const m = (lo + hi) >> 1; if (secs[m] <= t) { best = m; lo = m + 1; } else hi = m - 1; }
+      return best < 0 ? null : best; };
+    const groups = new Map();
+    for (const m of data.markers) {
+      const i = snap(m.time); if (i === null) continue;
+      const key = `${secs[i]}|${m.side}|${m.kind}`;
+      const g = groups.get(key);
+      if (g) { g.n++; g.px += m.price; g.pnl += (m.pnl_pct || 0); }
+      else groups.set(key, { i, t: lastBars[i].time, n: 1, px: m.price, pnl: m.pnl_pct || 0, m });
+    }
+    // Hard cap: these are chart objects, and past a few hundred Vela slows down.
+    const list = [...groups.values()].sort((a, b) => a.t - b.t).slice(0, 300);
+    const t = HubTheme;
+    for (const g of list) {
+      const buy = g.m.side === "BUY", bar = lastBars[g.i];
+      const avg = g.px / g.n;
+      const order = g.m.kind === "order";
+      const color = order
+        ? (g.m.status && g.m.status !== "filled" ? t.faint : (buy ? t.up : t.down))
+        : (g.m.kind === "backtest_entry" ? t.accent : (g.pnl >= 0 ? t.up : t.down));
+      // Anchor off the bar so the marker does not sit on top of the candle body.
+      const pad = (bar.high - bar.low || avg * 0.002) * 0.6;
+      const price = buy ? bar.low - pad : bar.high + pad;
+      const label = g.n > 1 ? `${g.m.side} x${g.n} @ ${avg.toPrecision(6)}` : g.m.text;
+      const r = ovAdd(buy ? OV_UP_TOOLS : OV_DOWN_TOOLS, buy ? ovUpTool : ovDownTool,
+                      { time: g.t, price }, color, label);
+      if (r) { ovHandles.push(r.handle); if (buy) ovUpTool = r.tool; else ovDownTool = r.tool; }
+      else ovWhy = "drawings.add failed for every tool name";
+    }
+    ovShowInfo(ovHandles.length);
+  } catch (e) { ovWhy = "threw: " + (e && e.message); throw e; } finally { ovBusy = false; }
+}
+
+const ovEl = (id) => document.getElementById(id);
+function ovShowInfo(drawn) {
+  const el = ovEl("ovinfo"); if (!el) return;
+  const i = ovInfoLast;
+  if (ovMode === "off" || !i) { el.textContent = ""; el.className = ""; return; }
+  if (!i.total) { el.textContent = "none in view"; el.className = ""; return; }
+  const grouped = drawn && drawn < i.shown ? `, grouped to ${drawn}` : "";
+  el.textContent = i.sampled ? `${i.shown} of ${i.total} sampled${grouped}` : `${i.total} marker${i.total === 1 ? "" : "s"}${grouped}`;
+  el.className = i.sampled ? "warn" : "";
+}
+
+async function ovLoadStrategies() {
+  const sel = ovEl("ovstrategy"); sel.innerHTML = "";
+  sel.add(new Option("All strategies", ""));
+  try {
+    const r = await fetch("/api/cait/backtests?table=" + encodeURIComponent(ovTable)).then((x) => x.json());
+    (r.strategies || []).forEach((n) => sel.add(new Option(n, n)));
+  } catch (e) {}
+}
+
+function ovSync() {
+  const on = ovAvailable();
+  ovEl("ovgroup").classList.toggle("show", on);
+  const bt = ovEl("ovmode").value === "backtest";
+  ovEl("ovtable").style.display = bt ? "" : "none";
+  ovEl("ovstrategy").style.display = bt ? "" : "none";
+  if (!on) { ovEl("ovinfo").textContent = ""; }
+}
+
+async function ovInit() {
+  try {
+    const r = await fetch("/api/cait/backtests").then((x) => x.json());
+    (r.tables || []).forEach((t) => ovEl("ovtable").add(new Option(t, t)));
+    ovEl("ovtable").value = ovTable;
+  } catch (e) {}
+  await ovLoadStrategies();
+  ovEl("ovmode").addEventListener("change", () => { ovMode = ovEl("ovmode").value; ovSync(); ovPaint(); });
+  ovEl("ovtable").addEventListener("change", async () => { ovTable = ovEl("ovtable").value; await ovLoadStrategies(); ovStrategy = ""; ovPaint(); });
+  ovEl("ovstrategy").addEventListener("change", () => { ovStrategy = ovEl("ovstrategy").value; ovPaint(); });
+  ovSync();
+}
+
 window.labChart = {
   name: "vela",
   // Switch in place: indicators re-run on the new bars; panes, drawings and settings stay.
@@ -223,6 +381,8 @@ window.labChart = {
   setMarket: (symbol, tf) => (window.LabDefaultSymbol = symbol, window.LabDefaultTF = tf || LabDefaultTF, ws.chart.setMarket({ symbol: "lab:" + symbol, timeframe: VELA_TF[tf] || "1" })),
   setTF: (t) => ws.chart.setTimeframe ? ws.chart.setTimeframe({ M1: "1", M5: "5", M15: "15", M30: "30", H1: "60", H4: "240", D1: "1D" }[t]) : null,
   addCodeTrendline,
+  setOverlay: async (mode, opts) => { ovMode = mode || "off"; if (opts) { if (opts.table) { ovTable = opts.table; document.getElementById("ovtable").value = ovTable; await ovLoadStrategies(); } ovStrategy = opts.strategy || ""; } document.getElementById("ovmode").value = ovMode; ovSync(); return ovPaint(); },
+  overlay: () => ({ mode: ovMode, table: ovTable, strategy: ovStrategy, available: ovAvailable(), last: ovInfoLast, drawn: ovHandles.length, why: ovWhy }),
   drawingCount: () => { try { return ws.chart.drawings.list().length; } catch (_) { return -1; } },
   barCount: () => lastBars.length,
 };

@@ -97,18 +97,24 @@ python hub/server.py
 
 ### Overlays
 
-On a `CAIT_*` ticker the **Lightweight Charts** engine can draw two overlays, kept
-visually distinct because they are different claims:
+On a `CAIT_*` ticker, **Vela** and **Lightweight Charts** can both draw two overlays,
+kept visually distinct because they are different claims:
 
 | Overlay | Source | Drawn as |
 |---|---|---|
 | `orders` | `bb8_orders` — what a venue actually did | arrows; unfilled statuses faint |
 | `backtest` | a `*_backtest_trades` table — what a model says *would* have happened | circles (entry) / squares (exit), coloured by P&L |
 
-Pick them from the toolbar: an **overlay dropdown** appears on the Lightweight
-engine whenever the chart is on a `CAIT_*` ticker (and disappears otherwise, since
+Pick them from the toolbar: an **overlay dropdown** appears whenever the chart is
+on a `CAIT_*` ticker (and disappears otherwise, since
 it has nothing to draw). Choosing *Backtest trades* reveals a table picker and a
 strategy picker, both populated from the database.
+
+On Vela the markers are real `arrowmarkup` / `arrowmarkdown` drawings placed just
+off each bar, capped at 300 objects; on Lightweight they are series markers. Note
+that Vela's bar times are epoch **milliseconds** while the markers API speaks
+seconds — the adapter converts, and getting that wrong sends the server a
+timestamp in the year 57927.
 
 A note beside the dropdown says how many markers are drawn, and turns amber when
 the set was sampled — e.g. `2000 of 12173 sampled, grouped to 38`, so a thinned

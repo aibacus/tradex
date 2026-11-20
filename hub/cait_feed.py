@@ -151,8 +151,13 @@ def _symbol_forms(sym):
     """
     s = sym.strip()
     out = {s, s.replace("/", "")}
-    if "/" not in s and len(s) > 3:
-        out.add(s[:-3] + "/" + s[-3:])
+    if "/" not in s:
+        # Split on a KNOWN quote, longest first. Assuming three characters turned
+        # BTCUSDT into "BTCUS/DT" and never produced the real "BTC/USDT".
+        for q in ("USDT", "USDC", "USD", "EUR", "GBP", "BTC", "ETH"):
+            if s.endswith(q) and len(s) > len(q):
+                out.add(s[: -len(q)] + "/" + q)
+                break
     return sorted(out)
 
 
@@ -170,9 +175,15 @@ SELECT EXTRACT(EPOCH FROM b)::bigint AS t,
        (array_agg(close ORDER BY "time" DESC))[1]::double precision,
        SUM(volume)::double precision
 FROM (
+  -- The lower bound is load-bearing, not an optimisation. GROUP BY means the
+  -- outer ORDER BY ... LIMIT cannot prune the scan: without it Postgres buckets
+  -- and aggregates EVERY row since the beginning of time before taking n. On a
+  -- 45-day prod window that merely looks slow; against the training DB's years
+  -- of history it is a multi-second full scan on every 15s reconcile, per chart.
   SELECT time_bucket(%(iv)s::interval, "time") AS b, "time", open, high, low, close, volume
   FROM crypto_ohlcvt
-  WHERE symbol = ANY(%(syms)s) AND "time" < %(to_ts)s
+  WHERE symbol = ANY(%(syms)s)
+    AND "time" < %(to_ts)s AND "time" >= %(from_ts)s
 ) s
 GROUP BY b ORDER BY b DESC LIMIT %(lim)s
 """
@@ -236,10 +247,13 @@ def history(ticker, tf, limit=1000, to_ms=None):
     to_ts = (int(to_ms) / 1000.0) if to_ms else time.time()
     iv = f"{minutes} minutes"
 
+    # Enough room for the bars asked for, plus slack for gaps (a symbol with no
+    # trades in a minute has no row, so N buckets span more than N*minutes).
+    span_s = minutes * 60 * limit
     if kind == "ohlcv":
         rows = _query(_SQL_OHLCV, {
             "iv": iv, "syms": _symbol_forms(sym),
-            "to_ts": _ts(to_ts), "lim": limit,
+            "to_ts": _ts(to_ts), "from_ts": _ts(to_ts - span_s * 3), "lim": limit,
         })
         return [{"time": int(r[0]), "open": float(r[1]), "high": float(r[2]),
                  "low": float(r[3]), "close": float(r[4]),
@@ -247,7 +261,6 @@ def history(ticker, tf, limit=1000, to_ms=None):
 
     # Book: bound the scan by time as well as LIMIT. orderbook_features is far too
     # large to let a LIMIT alone decide how much of it gets read.
-    span_s = minutes * 60 * limit
     rows = _query(_SQL_BOOK_RAW if minutes == 1 else _SQL_BOOK_1M, {
         "iv": iv, "sym": sym, "venue": venue,
         "to_ts": _ts(to_ts), "from_ts": _ts(to_ts - span_s * 1.5), "lim": limit,
@@ -378,8 +391,13 @@ WITH w AS (
 )
 SELECT EXTRACT(EPOCH FROM created_at)::bigint, side, status, px, qty, strategy, venue, total
 FROM w
-WHERE total <= %(lim)s OR (rn - 1) %% GREATEST(1, (total / %(lim)s)::bigint) = 0
-ORDER BY created_at LIMIT %(lim)s
+-- CEILING division. With floor division the stride is 1 for any
+-- lim < total < 2*lim, every row passes, and the trailing LIMIT then returns
+-- the OLDEST lim rows -- exactly the truncation this is meant to prevent.
+-- Ceiling guarantees at most lim rows survive, so no LIMIT is needed and the
+-- sample always spans the whole window.
+WHERE total <= %(lim)s OR (rn - 1) %% GREATEST(1, ((total + %(lim)s - 1) / %(lim)s)::bigint) = 0
+ORDER BY created_at
 """
 
 
@@ -455,7 +473,12 @@ def backtest_strategies(table_key):
     table = BACKTEST_TABLES.get(table_key)
     if not table:
         return []
-    return [r[0] for r in _query(f"SELECT DISTINCT strategy FROM {table} ORDER BY 1", {}) if r[0]]
+    # Bounded: the chart pages call this on every load and on every table
+    # change, and an unbounded DISTINCT is a full scan of the trades table.
+    return [r[0] for r in _query(
+        f"SELECT DISTINCT strategy FROM {table} "
+        f"WHERE entry_time > now() - %(window)s::interval ORDER BY 1",
+        {"window": os.getenv("CAIT_STRATEGY_WINDOW", "3 years")}) if r[0]]
 
 
 # --------------------------------------------------------------------------
@@ -526,8 +549,8 @@ class _Tail:
         for fn in fns:
             try:
                 fn(bar)
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_error = f"dispatch: {e.__class__.__name__}: {e}"
 
     def _run(self):
         try:
@@ -535,8 +558,13 @@ class _Tail:
         except Exception as e:
             self.last_error = f"confluent-kafka not installed: {e}"
             print("CAIT tail:", self.last_error, flush=True)
+            # Allow a later subscribe to try again rather than wedging the tail
+            # off for the lifetime of the process.
+            with self._lock:
+                self._thread = None
             return
         while True:
+            c = None
             try:
                 c = Consumer({
                     "bootstrap.servers": KAFKA_BOOTSTRAP,
@@ -556,6 +584,11 @@ class _Tail:
                     msg = c.poll(1.0)
                     if msg is None or msg.error():
                         continue
+                    # Counted BEFORE the decode: "raw climbing, matched zero" is
+                    # how a symbol-matching bug is told apart from a quiet topic,
+                    # and counting after the decode made an undecodable topic
+                    # report as quiet.
+                    self.raw += 1
                     try:
                         d = json.loads(msg.value())
                     except Exception as e:
@@ -563,7 +596,6 @@ class _Tail:
                         # behind what looked like an idle topic.
                         self.last_error = f"decode: {e.__class__.__name__}: {e}"
                         continue
-                    self.raw += 1
                     sym = str(d.get("symbol") or "").replace("/", "").upper()
                     if not sym:
                         continue
@@ -578,6 +610,14 @@ class _Tail:
             except Exception as e:
                 self.last_error = f"{e.__class__.__name__}: {e}"
                 print("CAIT tail reconnecting:", self.last_error, flush=True)
+            finally:
+                # librdkafka Consumers own broker threads and sockets; letting the
+                # loop drop them on the floor leaks a set every 5s during an outage.
+                if c is not None:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
                 time.sleep(5)
 
 
@@ -632,6 +672,10 @@ BOOK_POLL_S = float(os.getenv("CAIT_BOOK_POLL_SEC", "0.5"))
 
 _redis_client = None
 _redis_lock = threading.Lock()
+# Why the last book read failed. Without this, a missing `redis` package, a bad
+# password and a genuinely absent key all look identical to the caller, which is
+# the same trap the Kafka decode path already fell into.
+book_last_error = None
 
 
 def _redis_password():
@@ -671,9 +715,12 @@ def book_mid(venue, base):
 
     None means no book — never zero, never a stale carry-forward.
     """
+    global book_last_error
     try:
         raw = _redis().get(f"{venue}:orderbook:{base.upper()}")
-    except Exception:
+        book_last_error = None
+    except Exception as e:
+        book_last_error = f"{e.__class__.__name__}: {e}"
         return None, None
     if not raw:
         return None, None

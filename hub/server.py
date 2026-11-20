@@ -358,11 +358,26 @@ async def stream_cait(ws, symbol, tf):
     q = asyncio.Queue(maxsize=256)
 
     # The tail thread calls this; hop to the event loop before touching the socket.
+    def _push(bar):
+        # Runs ON the loop. call_soon_threadsafe only SCHEDULES, so a QueueFull
+        # raised by put_nowait surfaces here in the loop's exception handler, not
+        # at the call site -- catching it there was a no-op.
+        try:
+            q.put_nowait(bar)
+        except asyncio.QueueFull:
+            # A forming bar supersedes its predecessor, so drop the OLDEST and
+            # keep the newest rather than discarding the fresh one.
+            try:
+                q.get_nowait()
+                q.put_nowait(bar)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
     def on_bar(bar):
         try:
-            loop.call_soon_threadsafe(q.put_nowait, bar)
-        except (RuntimeError, asyncio.QueueFull):
-            pass
+            loop.call_soon_threadsafe(_push, bar)
+        except RuntimeError:
+            pass        # loop closed: the stream is gone
 
     live = kind == "ohlcv" and cait_feed.kafka_enabled()
     if live:
@@ -393,40 +408,46 @@ async def stream_cait(ws, symbol, tf):
                 await asyncio.sleep(cait_feed.BOOK_POLL_S)
         book_task = asyncio.create_task(book_loop())
 
-    # base: the last bar as the database gave it. minute_vol: per-minute volume
-    # seen on the tail SINCE that snapshot, keyed by minute so a repeated update
-    # of the same forming minute replaces rather than double-counts.
+    # base: the last bar as the database gave it.
+    #
+    # Volume is deliberately NOT rebuilt from the tail. The collector publishes
+    # each 1-minute bar as it forms and the writer lands those same partial
+    # bars, so any additive scheme double-counts the forming minute (it is
+    # already inside base["volume"]) or loses it when the writer lags -- and
+    # either way the number visibly jumps when the reconcile resets it. Price
+    # comes from the tail, volume stays whatever the database last said, and the
+    # reconcile corrects it every RECONCILE_S.
     base = dict(bars[-1]) if bars else None
     base_at = time.time()
-    minute_vol = {}
 
     def fold(bar):
-        """Merge a 1-minute tail bar into the current bucket. Returns a bar or None."""
-        nonlocal base, minute_vol
-        if base is None:
-            return None
+        """Merge a tail bar into the current bucket. Returns a bar or None."""
+        nonlocal base
         start = bar["time"] - bar["time"] % span
+        if base is None:
+            # Seed from the live source. Without this a series whose Postgres
+            # history is empty -- exactly when the live feed matters most --
+            # would never draw anything at all.
+            base = {"time": start, "open": bar["open"], "high": bar["high"],
+                    "low": bar["low"], "close": bar["close"], "volume": bar["volume"]}
+            return dict(base)
         if start < base["time"]:
             return None                       # older bucket: history already has it
         if start > base["time"]:              # a new bucket opened
             base = {"time": start, "open": bar["open"], "high": bar["high"],
-                    "low": bar["low"], "close": bar["close"], "volume": 0.0}
-            minute_vol = {}
-        out = dict(base)
-        out["high"] = max(out["high"], bar["high"])
-        out["low"] = min(out["low"], bar["low"])
-        out["close"] = bar["close"]
-        # Only minutes that started after the DB snapshot can be added; anything
-        # at or before it is already inside base["volume"].
-        if bar["time"] > base_at - 60:
-            minute_vol[bar["time"]] = bar["volume"]
-        out["volume"] = base["volume"] + sum(minute_vol.values())
-        base["high"], base["low"], base["close"] = out["high"], out["low"], out["close"]
-        return out
+                    "low": bar["low"], "close": bar["close"], "volume": bar["volume"]}
+            return dict(base)
+        base["high"] = max(base["high"], bar["high"])
+        base["low"] = min(base["low"], bar["low"])
+        base["close"] = bar["close"]
+        return dict(base)
 
     last_sent = 0.0
     sent_time = base["time"] if base else 0
     sent_bar = None
+    # Throttled updates are held, not discarded: dropping the last one before a
+    # bucket rolls leaves the closing candle stale until the next reconcile.
+    pending = None
 
     async def emit(bar):
         """Send a bar, never going backwards and never repeating one unchanged.
@@ -447,10 +468,15 @@ async def stream_cait(ws, symbol, tf):
             try:
                 bar = await asyncio.wait_for(q.get(), timeout=cait_feed.RECONCILE_S)
                 out = fold(bar)
-                if out and time.time() - last_sent >= 0.2:   # at most 5 updates a second
-                    await emit(out)
+                if out:
+                    pending = out                            # keep the newest
+                if pending and time.time() - last_sent >= 0.2:   # 5 updates a second
+                    await emit(pending)
+                    pending = None
             except asyncio.TimeoutError:
-                pass                                  # fall through to the reconcile
+                if pending:                           # flush anything the throttle held
+                    await emit(pending)
+                    pending = None
             except websockets.ConnectionClosed:
                 return
 
@@ -472,10 +498,10 @@ async def stream_cait(ws, symbol, tf):
                     match = next((b for b in tail if base and b["time"] == base["time"]), None)
                     newest = tail[-1]
                     if newest["time"] > (base["time"] if base else 0):
-                        base, minute_vol = dict(newest), {}
+                        base = dict(newest)
                         await emit(newest)
                     elif match:
-                        base, minute_vol = dict(match), {}
+                        base = dict(match)
                         await emit(match)
     finally:
         if live:
@@ -1166,7 +1192,8 @@ class LabHandler(SimpleHTTPRequestHandler):
                 # are not confused for each other.
                 mid, ts = cait_feed.book_mid(q_venue := "kraken", "BTC")
                 book.update(probe=f"{q_venue}:orderbook:BTC", mid=mid,
-                            age_sec=round(time.time() - ts, 2) if ts else None)
+                            age_sec=round(time.time() - ts, 2) if ts else None,
+                            error=cait_feed.book_last_error)
             return self._json({"enabled": cait_feed.kafka_enabled(), "topic": cait_feed.KAFKA_TOPIC,
                                "raw": t.raw, "matched": t.messages,
                                "symbols_subscribed": sorted(t._subs),

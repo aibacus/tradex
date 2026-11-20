@@ -336,28 +336,125 @@ def cait_history(symbol, tf, limit=HISTORY, to_ms=None):
     return cait_feed.history(symbol, tf, int(limit or HISTORY), to_ms)
 
 async def stream_cait(ws, symbol, tf):
-    """History, then poll the newest bar. The database is the live edge here: there is
-    no exchange socket to attach to, and a poll keeps this strictly read-only."""
+    """History from Postgres, then the forming bar from the Kafka tail.
+
+    Postgres stays authoritative: every RECONCILE_S the bar is re-read from the
+    database and whatever the tail built is replaced. The tail only buys latency
+    between those reconciles -- it carries one collector's view, the database
+    merges them all, so it must never be the last word.
+
+    When the tail is off, or does not carry this symbol, the reconcile IS the
+    update path and the behaviour degrades to the old poll.
+    """
     try:
         bars = await asyncio.to_thread(cait_history, symbol, tf)
     except Exception as e:
         await ws.send(json.dumps({"type": "error", "msg": f"CAIT history failed: {e}"})); return
     await ws.send(json.dumps({"type": "history", "bars": bars, "source": "cait", "symbol": symbol, "tf": tf}))
-    last = dict(bars[-1]) if bars else None
-    while True:
-        await asyncio.sleep(cait_feed.POLL_S)
+
+    span = TF_SEC[tf]
+    kind, sym, _venue = cait_feed.parse(symbol)
+    loop = asyncio.get_running_loop()
+    q = asyncio.Queue(maxsize=256)
+
+    # The tail thread calls this; hop to the event loop before touching the socket.
+    def on_bar(bar):
         try:
-            tail = await asyncio.to_thread(cait_history, symbol, tf, 2)
-        except websockets.ConnectionClosed:
+            loop.call_soon_threadsafe(q.put_nowait, bar)
+        except (RuntimeError, asyncio.QueueFull):
+            pass
+
+    live = kind == "ohlcv" and cait_feed.kafka_enabled()
+    if live:
+        cait_feed.TAIL.subscribe(sym, on_bar)
+
+    # base: the last bar as the database gave it. minute_vol: per-minute volume
+    # seen on the tail SINCE that snapshot, keyed by minute so a repeated update
+    # of the same forming minute replaces rather than double-counts.
+    base = dict(bars[-1]) if bars else None
+    base_at = time.time()
+    minute_vol = {}
+
+    def fold(bar):
+        """Merge a 1-minute tail bar into the current bucket. Returns a bar or None."""
+        nonlocal base, minute_vol
+        if base is None:
+            return None
+        start = bar["time"] - bar["time"] % span
+        if start < base["time"]:
+            return None                       # older bucket: history already has it
+        if start > base["time"]:              # a new bucket opened
+            base = {"time": start, "open": bar["open"], "high": bar["high"],
+                    "low": bar["low"], "close": bar["close"], "volume": 0.0}
+            minute_vol = {}
+        out = dict(base)
+        out["high"] = max(out["high"], bar["high"])
+        out["low"] = min(out["low"], bar["low"])
+        out["close"] = bar["close"]
+        # Only minutes that started after the DB snapshot can be added; anything
+        # at or before it is already inside base["volume"].
+        if bar["time"] > base_at - 60:
+            minute_vol[bar["time"]] = bar["volume"]
+        out["volume"] = base["volume"] + sum(minute_vol.values())
+        base["high"], base["low"], base["close"] = out["high"], out["low"], out["close"]
+        return out
+
+    last_sent = 0.0
+    sent_time = base["time"] if base else 0
+    sent_bar = None
+
+    async def emit(bar):
+        """Send a bar, never going backwards and never repeating one unchanged.
+
+        The tail runs ahead of the database by design, so a reconcile can hand us
+        a bar OLDER than one already drawn. Sending it would walk the chart's
+        last candle backwards.
+        """
+        nonlocal last_sent, sent_time, sent_bar
+        if bar["time"] < sent_time or bar == sent_bar:
             return
-        except Exception as e:
-            await ws.send(json.dumps({"type": "status", "msg": f"CAIT reconnecting: {e}"}))
-            continue
-        for b in tail:
-            # Emit a bar when it is new, or when the forming one moved.
-            if last is None or b["time"] > last["time"] or (b["time"] == last["time"] and b != last):
-                last = dict(b)
-                await ws.send(json.dumps({"type": "bar", "bar": b, "sent": int(time.time() * 1000)}))
+        now = time.time()
+        last_sent, sent_time, sent_bar = now, bar["time"], dict(bar)
+        await ws.send(json.dumps({"type": "bar", "bar": bar, "sent": int(now * 1000)}))
+
+    try:
+        while True:
+            try:
+                bar = await asyncio.wait_for(q.get(), timeout=cait_feed.RECONCILE_S)
+                out = fold(bar)
+                if out and time.time() - last_sent >= 0.2:   # at most 5 updates a second
+                    await emit(out)
+            except asyncio.TimeoutError:
+                pass                                  # fall through to the reconcile
+            except websockets.ConnectionClosed:
+                return
+
+            # Reconcile: the database is the authority, on a timer either way.
+            if time.time() - base_at >= cait_feed.RECONCILE_S:
+                try:
+                    tail = await asyncio.to_thread(cait_history, symbol, tf, 2)
+                except websockets.ConnectionClosed:
+                    return
+                except Exception as e:
+                    await ws.send(json.dumps({"type": "status", "msg": f"CAIT reconnecting: {e}"}))
+                    base_at = time.time()
+                    continue
+                base_at = time.time()
+                if tail:
+                    # Correct the bucket we are actually on, if the database has
+                    # reached it; otherwise leave the tail's version standing and
+                    # wait for the writer to catch up.
+                    match = next((b for b in tail if base and b["time"] == base["time"]), None)
+                    newest = tail[-1]
+                    if newest["time"] > (base["time"] if base else 0):
+                        base, minute_vol = dict(newest), {}
+                        await emit(newest)
+                    elif match:
+                        base, minute_vol = dict(match), {}
+                        await emit(match)
+    finally:
+        if live:
+            cait_feed.TAIL.unsubscribe(sym, on_bar)
 
 # ---------------- Binance (no login) ----------------
 async def stream_binance(ws, symbol, tf):
@@ -1032,6 +1129,15 @@ class LabHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 logbus.ev("server", "warn", f"cait markers {q.get('symbol')}: {e}", every=30)
                 return self._json({"error": f"{e.__class__.__name__}: {e}"}, 502)
+        if self.path.startswith("/api/cait/tail"):
+            # "Is the live feed actually live?" — the question an idle-looking
+            # chart should be able to answer without reading logs.
+            t = cait_feed.TAIL
+            return self._json({"enabled": cait_feed.kafka_enabled(), "topic": cait_feed.KAFKA_TOPIC,
+                               "raw": t.raw, "matched": t.messages,
+                               "symbols_subscribed": sorted(t._subs),
+                               "error": t.last_error,
+                               "reconcile_sec": cait_feed.RECONCILE_S}, 200)
         if self.path.startswith("/api/cait/backtests"):
             try:
                 return self._json({"tables": sorted(cait_feed.BACKTEST_TABLES),

@@ -137,6 +137,30 @@ chart never implies it is showing everything.
 `GET /api/cait/markers?symbol=&from=&to=&kind=orders|backtest[&table=&strategy=&status=]`
 and `GET /api/cait/backtests?table=` back these.
 
+### Live updates
+
+With `CAIT_KAFKA_BOOTSTRAP` set, the forming bar comes from the `crypto-ohlcvt`
+Kafka topic instead of being polled out of Postgres — the same shape as every
+other TradeX feed (history over REST, the live edge over a socket).
+
+```bash
+export CAIT_KAFKA_BOOTSTRAP=<host>:29092   # optional; without it the feed polls
+```
+
+Postgres stays authoritative. Every `CAIT_RECONCILE_SEC` (default 15) the bar is
+re-read from the database and replaces whatever the tail built, because the
+database merges several collectors while the topic carries one. If the tail is
+off, or does not carry a symbol, that reconcile is the update path and behaviour
+degrades to the old poll.
+
+The consumer uses `assign()`, never `subscribe()`: it starts at the end of each
+partition and joins no consumer group, so a chart can never accrue lag, appear in
+consumer-group monitoring, or become the thing that looks healthy while consuming
+nothing.
+
+`GET /api/cait/tail` answers "is the live feed actually live?" — messages seen,
+messages matched, subscribed symbols, last error.
+
 All access is read-only: the pool sets `default_transaction_read_only=on` and a 30 s
 `statement_timeout`, and the feed never writes. Point it at a role with `SELECT` and nothing
 else. Other settings: `CAIT_DB_PORT` (5432), `CAIT_DB_NAME` (crypto_ai_prod), `CAIT_DB_SSLMODE`,

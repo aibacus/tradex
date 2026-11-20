@@ -35,6 +35,7 @@ Configuration (all env, no defaults that reach a live host):
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -455,3 +456,153 @@ def backtest_strategies(table_key):
     if not table:
         return []
     return [r[0] for r in _query(f"SELECT DISTINCT strategy FROM {table} ORDER BY 1", {}) if r[0]]
+
+
+# --------------------------------------------------------------------------
+# Live tail: the forming bar from Kafka, not from polling Postgres
+# --------------------------------------------------------------------------
+# The collector publishes each 1-minute bar to `crypto-ohlcvt` as it forms. That
+# is the same bar the DB writer later lands, so polling Postgres for it adds the
+# writer's ~3s plus up to a full poll interval for nothing. This tails the topic
+# instead and the chart updates within a second, which is what every other TradeX
+# feed already does (REST history + a live socket).
+#
+# Deliberate choices:
+#   * assign(), never subscribe(). A chart wants "what is happening now" and has
+#     no business owning a committed offset. With assign() librdkafka does not
+#     join a consumer group, so this can never show up in consumer-group
+#     monitoring, never accrues lag, and cannot be the thing that looks healthy
+#     while consuming nothing (the 2026-09-22 failure mode).
+#   * Start at the END of each partition. History comes from Postgres; replaying
+#     the topic from the beginning would be both slow and wrong.
+#   * Postgres stays authoritative. The DB merges several collectors while this
+#     topic carries only the Kraken rapid collector (measured: 18 of 21 symbols,
+#     every message `rapid_kraken_websocket`), so a periodic reconcile re-reads
+#     the bar from the database and overwrites whatever the tail built.
+KAFKA_BOOTSTRAP = os.getenv("CAIT_KAFKA_BOOTSTRAP", "").strip()
+KAFKA_TOPIC = os.getenv("CAIT_KAFKA_TOPIC", "crypto-ohlcvt").strip()
+# How often the database corrects the live tail. Also the poll cadence when the
+# tail is unavailable or does not carry this symbol.
+RECONCILE_S = float(os.getenv("CAIT_RECONCILE_SEC", "15"))
+
+
+def kafka_enabled():
+    return bool(KAFKA_BOOTSTRAP)
+
+
+class _Tail:
+    """One consumer thread for the process; fans 1-minute bars out to streams."""
+
+    def __init__(self):
+        self._subs = {}            # SYMBOL -> set of callables
+        self._lock = threading.Lock()
+        self._thread = None
+        self.last_error = None
+        self.messages = 0
+        # raw counts every message on the topic, messages only those a chart asked
+        # for. The pair distinguishes "topic is quiet" from "nobody wants these".
+        self.raw = 0
+
+    def subscribe(self, symbol, fn):
+        key = symbol.replace("/", "").upper()
+        with self._lock:
+            self._subs.setdefault(key, set()).add(fn)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+
+    def unsubscribe(self, symbol, fn):
+        key = symbol.replace("/", "").upper()
+        with self._lock:
+            s = self._subs.get(key)
+            if s:
+                s.discard(fn)
+                if not s:
+                    self._subs.pop(key, None)
+
+    def _dispatch(self, symbol, bar):
+        with self._lock:
+            fns = list(self._subs.get(symbol, ()))
+        for fn in fns:
+            try:
+                fn(bar)
+            except Exception:
+                pass
+
+    def _run(self):
+        try:
+            from confluent_kafka import Consumer, TopicPartition, OFFSET_END
+        except Exception as e:
+            self.last_error = f"confluent-kafka not installed: {e}"
+            print("CAIT tail:", self.last_error, flush=True)
+            return
+        while True:
+            try:
+                c = Consumer({
+                    "bootstrap.servers": KAFKA_BOOTSTRAP,
+                    # librdkafka requires a group.id even for assign(). With
+                    # assign() no group is joined, so nothing is registered
+                    # broker-side and nothing is ever committed.
+                    "group.id": "tradex-chart-tail-no-group",
+                    "enable.auto.commit": False,
+                    "socket.keepalive.enable": True,
+                })
+                meta = c.list_topics(KAFKA_TOPIC, timeout=10)
+                parts = list(meta.topics[KAFKA_TOPIC].partitions)
+                c.assign([TopicPartition(KAFKA_TOPIC, p, OFFSET_END) for p in parts])
+                print(f"CAIT tail: {KAFKA_TOPIC} {len(parts)} partition(s) from end", flush=True)
+                self.last_error = None
+                while True:
+                    msg = c.poll(1.0)
+                    if msg is None or msg.error():
+                        continue
+                    try:
+                        d = json.loads(msg.value())
+                    except Exception as e:
+                        # Record it: a bare `continue` here hid a missing import
+                        # behind what looked like an idle topic.
+                        self.last_error = f"decode: {e.__class__.__name__}: {e}"
+                        continue
+                    self.raw += 1
+                    sym = str(d.get("symbol") or "").replace("/", "").upper()
+                    if not sym:
+                        continue
+                    with self._lock:
+                        wanted = sym in self._subs
+                    if not wanted:
+                        continue
+                    bar = _bar_from_message(d)
+                    if bar:
+                        self.messages += 1
+                        self._dispatch(sym, bar)
+            except Exception as e:
+                self.last_error = f"{e.__class__.__name__}: {e}"
+                print("CAIT tail reconnecting:", self.last_error, flush=True)
+                time.sleep(5)
+
+
+def _bar_from_message(d):
+    """One 1-minute bar from a `crypto-ohlcvt` payload, or None if unusable."""
+    from datetime import datetime
+    t = d.get("time") or d.get("timestamp")
+    if not t:
+        return None
+    try:
+        ts = int(datetime.fromisoformat(str(t).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+    try:
+        close = float(d.get("close", d.get("price")))
+        return {
+            "time": ts - ts % 60,
+            "open": float(d.get("open", close)),
+            "high": float(d.get("high", close)),
+            "low": float(d.get("low", close)),
+            "close": close,
+            "volume": float(d.get("volume") or 0.0),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+TAIL = _Tail()

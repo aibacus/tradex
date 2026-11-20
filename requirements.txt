@@ -7,3 +7,5 @@ pyarrow>=15
 # MetaTrader5
 # CAIT feed (CAIT_DB_HOST set): read-only candles from a CAIT TimescaleDB.
 psycopg2-binary>=2.9
+# CAIT live tail (CAIT_KAFKA_BOOTSTRAP set): the forming bar from Kafka.
+confluent-kafka>=2.5

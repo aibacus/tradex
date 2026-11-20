@@ -55,6 +55,7 @@ function makePrice() {
     line: [LC.LineSeries, { color: HubTheme.accent, lineWidth: 2 }],
     area: [LC.AreaSeries, { lineColor: HubTheme.accent, topColor: HubTheme.upVol, bottomColor: "rgba(0,0,0,0)" }] }[style];
   price = chart.addSeries(opts[0], opts[1], 0);
+  markersApi = null;
   const saved = drawings ? drawings.exportJSON() : null;
   if (drawings) drawings.destroy();
   drawings = new LD.DrawingManager(chart, price, { magnet: "weak" });
@@ -103,6 +104,98 @@ function paintAll() {
   }
 }
 
+
+// ---- CAIT overlays: real orders, or a backtest's entries and exits ----------
+// Only available on a CAIT_* ticker; everything else has nothing to overlay.
+// The two kinds are drawn differently on purpose. An order is something a venue
+// did. A backtest marker is something a model says would have happened. Drawing
+// them identically would invite reading one as the other.
+let markersApi = null, overlayMode = "off", overlayTable = "donchian", overlayStrategy = "", lastOverlayInfo = null;
+
+function overlayAvailable() { return /^CAIT_/.test(sym); }
+
+function markerStyle(m) {
+  const t = HubTheme, buy = m.side === "BUY";
+  if (m.kind === "order") {
+    const unfilled = m.status && m.status !== "filled";
+    return {
+      position: buy ? "belowBar" : "aboveBar",
+      shape: buy ? "arrowUp" : "arrowDown",
+      // An unfilled order is drawn faint: it is a request, not an execution.
+      color: unfilled ? t.faint : (buy ? t.up : t.down),
+      text: m.text,
+    };
+  }
+  const entry = m.kind === "backtest_entry";
+  return {
+    position: buy ? "belowBar" : "aboveBar",
+    shape: entry ? "circle" : "square",
+    color: entry ? t.accent : (m.pnl_pct >= 0 ? t.up : t.down),
+    text: m.text,
+  };
+}
+
+async function paintOverlay() {
+  if (!price) return;
+  if (markersApi) { markersApi.setMarkers([]); }
+  if (overlayMode === "off" || !overlayAvailable() || !bars.length) return;
+  const from = bars[0].time, to = bars[bars.length - 1].time + 86400;
+  const q = new URLSearchParams({ symbol: sym, from, to, kind: overlayMode === "orders" ? "orders" : "backtest" });
+  if (overlayMode === "orders") q.set("status", "filled");
+  else { q.set("table", overlayTable); if (overlayStrategy) q.set("strategy", overlayStrategy); }
+  let data;
+  try { data = await fetch("/api/cait/markers?" + q).then((r) => r.json()); }
+  catch (e) { return; }
+  if (data.error || !data.markers) return;
+  // The server thins a dense window rather than returning only its oldest slice.
+  // Say so on the chart: markers that are a sample must not read as the whole set.
+  if (data.sampled) {
+    console.info(`CAIT overlay: showing ${data.markers.length} of ${data.total} — evenly sampled across the window.`);
+  }
+  lastOverlayInfo = { shown: data.markers.length, total: data.total || data.markers.length, sampled: !!data.sampled };
+  // Snap each marker to the bar that contains it: Lightweight anchors markers to
+  // a bar time, and a raw timestamp between bars is dropped silently.
+  const times = bars.map((b) => b.time);
+  const snap = (t) => {
+    let lo = 0, hi = times.length - 1, best = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (times[mid] <= t) { best = mid; lo = mid + 1; } else hi = mid - 1; }
+    return best < 0 ? null : times[best];
+  };
+  // Collapse everything that lands on the same bar and side into one marker.
+  // Without this a day with 400 fills draws 400 overlapping arrows and 400
+  // overlapping labels, which is not a chart — it is a smear. One arrow per
+  // bar per side, labelled with the count and the average price, is readable
+  // and says strictly more than the pile did.
+  const groups = new Map();
+  for (const m of data.markers) {
+    const t = snap(m.time);
+    if (t === null) continue;
+    const key = `${t}|${m.side}|${m.kind}`;
+    const g = groups.get(key);
+    if (g) { g.n++; g.px += m.price; if (m.pnl_pct != null) g.pnl += m.pnl_pct; }
+    else groups.set(key, { t, n: 1, px: m.price, pnl: m.pnl_pct || 0, m });
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    const avg = g.px / g.n;
+    const st = markerStyle(g.m);
+    if (g.n > 1) {
+      st.text = `${g.m.side} x${g.n} avg ${avg.toPrecision(6)}`
+        + (g.m.kind !== "order" ? ` · ${(g.pnl / g.n >= 0 ? "+" : "")}${(g.pnl / g.n).toFixed(2)}% avg` : "");
+      if (g.m.kind !== "order") st.color = g.pnl >= 0 ? HubTheme.up : HubTheme.down;
+    }
+    out.push({ time: g.t, ...st });
+  }
+  // Labels still collide when several bars close together carry markers, and a
+  // wall of overlapping text is worse than none: the arrows already carry the
+  // signal. 20 is where labels stop being readable at a typical window width
+  // (measured on ETHUSD D1, which groups to 38 and was unreadable with text).
+  if (out.length > 20) out.forEach((o) => { o.text = ""; });
+  out.sort((a, b) => a.time - b.time);
+  if (!markersApi) markersApi = LC.createSeriesMarkers(price, out);
+  else markersApi.setMarkers(out);
+}
+
 let loadGen = 0;
 async function load() {
   const my = ++loadGen;               // a newer switch cancels this one
@@ -112,6 +205,7 @@ async function load() {
   bars = fresh;
   paintAll();
   drawings.clear();
+  paintOverlay();
   let lastRepaint = 0;
   stop = LabFeed.live(sym, tf, (b) => {
     if (my !== loadGen) return;
@@ -131,7 +225,7 @@ chart.timeScale().subscribeVisibleLogicalRangeChange(async (r) => {
   try {
     const older = await LabFeed.history(sym, tf, bars[0].time * 1000 - 1, 1000, srcOf(sym));
     const fresh = older.filter((b) => b.time < bars[0].time);
-    if (fresh.length) { bars = fresh.concat(bars); paintAll(); }
+    if (fresh.length) { bars = fresh.concat(bars); paintAll(); paintOverlay(); }
   } finally { loadingOlder = false; }
 });
 
@@ -177,7 +271,9 @@ function applyTheme() {
     grid: { vertLines: { color: t.grid }, horzLines: { color: t.grid } }, rightPriceScale: { borderColor: t.line }, timeScale: { borderColor: t.line } });
   makePrice(); paintAll();
 }
-window.labChart = { name: "lightweight", applyTheme, setMarket: (s, t) => { sym = s; tf = t || tf; if (![...symSel.options].some((o) => o.value === s)) symSel.add(new Option(s, s)); symSel.value = s; markTF(); return load(); }, setTF: (t) => { tf = t; markTF(); return load(); }, addCodeTrendline, drawingCount: () => drawings.drawings().length, barCount: () => bars.length };
+window.labChart = { name: "lightweight", applyTheme, setMarket: (s, t) => { sym = s; tf = t || tf; if (![...symSel.options].some((o) => o.value === s)) symSel.add(new Option(s, s)); symSel.value = s; markTF(); return load(); }, setTF: (t) => { tf = t; markTF(); return load(); }, addCodeTrendline, drawingCount: () => drawings.drawings().length, barCount: () => bars.length,
+  setOverlay: (mode, opts) => { overlayMode = mode || "off"; if (opts) { if (opts.table) overlayTable = opts.table; overlayStrategy = opts.strategy || ""; } return paintOverlay(); },
+  overlay: () => ({ mode: overlayMode, table: overlayTable, strategy: overlayStrategy, available: overlayAvailable(), last: lastOverlayInfo }) };
 makePrice(); markTF(); load();
 </script>
 </body></html>

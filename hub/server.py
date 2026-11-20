@@ -1003,6 +1003,43 @@ class LabHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 logbus.ev("server", "warn", f"orderflow profile {q.get('symbol')} {q.get('tf')}: {e}", every=30)
                 return self._json({"error": f"{e.__class__.__name__}: {e}"}, 502)
+        if self.path.startswith("/api/cait/markers"):
+            # Overlays for a CAIT chart: real orders, or a backtest's entries and
+            # exits. Kept apart by `kind` because they are different claims — one
+            # is what a venue did, the other is what a model says it would have.
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            try:
+                now = int(time.time())
+                a, b = int(q.get("from", now - 7 * 86400)), int(q.get("to", now))
+                sym = q.get("symbol", "")
+                kind = q.get("kind", "orders")
+                if kind == "backtest":
+                    rows = cait_feed.backtest_markers(sym, a, b, q.get("table", "donchian"),
+                                                      q.get("strategy") or None,
+                                                      int(q.get("limit", 2000)))
+                else:
+                    st = tuple(x for x in (q.get("status", "filled") or "").split(",") if x)
+                    lim = int(q.get("limit", 2000))
+                    rows, total = cait_feed.order_markers(sym, a, b, st or ("filled",), lim)
+                    # Say when the series was thinned. A chart that silently drops
+                    # markers is a chart that lies about how much happened.
+                    return self._json({"markers": rows, "symbol": sym, "kind": kind,
+                                       "from": a, "to": b, "total": total,
+                                       "sampled": total > len(rows)}, 200)
+                return self._json({"markers": rows, "symbol": sym, "kind": kind,
+                                   "from": a, "to": b, "total": len(rows),
+                                   "sampled": False}, 200)
+            except Exception as e:
+                logbus.ev("server", "warn", f"cait markers {q.get('symbol')}: {e}", every=30)
+                return self._json({"error": f"{e.__class__.__name__}: {e}"}, 502)
+        if self.path.startswith("/api/cait/backtests"):
+            try:
+                return self._json({"tables": sorted(cait_feed.BACKTEST_TABLES),
+                                   "strategies": cait_feed.backtest_strategies(
+                                       {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+                                       .get("table", "donchian"))}, 200)
+            except Exception as e:
+                return self._json({"error": f"{e.__class__.__name__}: {e}"}, 502)
         if not self.path.startswith("/api/bars"):
             if not static_allowed(self.path):
                 return self._json({"error": "not found"}, 404)

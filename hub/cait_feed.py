@@ -331,3 +331,127 @@ def instrument_base(ticker):
     if not base.endswith("USD"):
         base += "USD"
     return base, f"book mid @ {venue}"
+
+
+# --------------------------------------------------------------------------
+# Overlays: what actually traded, and what a backtest said would have
+# --------------------------------------------------------------------------
+# Two different kinds of claim, deliberately never merged into one list:
+#
+#   orders    rows from bb8_orders. What a venue did (or refused to do).
+#   backtest  rows from a *_backtest_trades table. What a model says would have
+#             happened. These are not trades and must never be shown as if they were.
+#
+# BB8 (the Go executor) is the sole author of execution state. This module only
+# ever SELECTs; a chart that wrote here would be a second author, which is the
+# failure this codebase already shipped once.
+
+# Whitelist, because the table name is interpolated into SQL. A caller cannot
+# reach an arbitrary table through this parameter.
+BACKTEST_TABLES = {
+    "donchian": "donchian_backtest_trades",
+    "session_momentum": "session_momentum_backtest_trades",
+    "mr_refined": "mr_refined_backtest_trades",
+    "wr2": "wr2_backtest_trades",
+}
+
+# A busy symbol can have tens of thousands of orders inside one chart window.
+# `ORDER BY created_at LIMIT n` would then return only the OLDEST n, so the chart
+# would show markers for the first few days of the window and nothing after —
+# silently, and looking exactly like "there were no orders later". Instead, count
+# first and take an even stride through the window, so the whole range is
+# represented and the caller is told the series was thinned.
+_SQL_ORDERS = """
+WITH w AS (
+  SELECT created_at, side, status,
+         COALESCE(filled_price, price)::double precision       AS px,
+         COALESCE(filled_quantity, quantity)::double precision AS qty,
+         COALESCE(bb8_strategy, '')                            AS strategy,
+         COALESCE(exchange, '')                                AS venue,
+         row_number() OVER (ORDER BY created_at) AS rn,
+         count(*)     OVER ()                    AS total
+  FROM bb8_orders
+  WHERE symbol = ANY(%(syms)s)
+    AND created_at >= %(from_ts)s AND created_at < %(to_ts)s
+    AND status = ANY(%(statuses)s)
+)
+SELECT EXTRACT(EPOCH FROM created_at)::bigint, side, status, px, qty, strategy, venue, total
+FROM w
+WHERE total <= %(lim)s OR (rn - 1) %% GREATEST(1, (total / %(lim)s)::bigint) = 0
+ORDER BY created_at LIMIT %(lim)s
+"""
+
+
+def order_markers(ticker, from_s, to_s, statuses=("filled",), limit=2000):
+    """(markers, total_in_window). Side is reported as-is; entry/exit is not inferred.
+
+    When total > limit the markers are an even sample across the window, not the
+    first `limit` of them — see the query. Callers should surface the thinning.
+    """
+    kind, sym, _venue = parse(ticker)
+    if kind != "ohlcv":
+        return [], 0  # a book-mid series has no orders of its own
+    rows = _query(_SQL_ORDERS, {
+        "syms": _symbol_forms(sym), "from_ts": _ts(from_s), "to_ts": _ts(to_s),
+        "statuses": list(statuses), "lim": int(limit),
+    })
+    total = int(rows[0][7]) if rows else 0
+    out = []
+    for t, side, status, px, qty, strategy, venue, _total in rows:
+        if px is None:
+            continue
+        buy = (side or "").upper().startswith("B")
+        # 'pending' means queued, not executed. Say so rather than drawing it as a fill.
+        note = "" if status == "filled" else f" [{status}]"
+        out.append({
+            "kind": "order", "time": int(t), "side": "BUY" if buy else "SELL",
+            "price": float(px), "qty": float(qty or 0.0), "status": status,
+            "strategy": strategy, "venue": venue,
+            "text": f"{'BUY' if buy else 'SELL'} {float(qty or 0):g} @ {float(px):g}"
+                    + (f" · {strategy}" if strategy else "") + note,
+        })
+    return out, total
+
+
+def backtest_markers(ticker, from_s, to_s, table_key, strategy=None, limit=2000):
+    """Entry and exit points from a *_backtest_trades table. NOT trades that happened."""
+    kind, sym, _venue = parse(ticker)
+    if kind != "ohlcv":
+        return []
+    table = BACKTEST_TABLES.get(table_key)
+    if not table:
+        raise ValueError(f"unknown backtest table {table_key!r}; known: {', '.join(sorted(BACKTEST_TABLES))}")
+    sql = f"""
+        SELECT strategy, side,
+               EXTRACT(EPOCH FROM entry_time)::bigint, entry_price::double precision,
+               EXTRACT(EPOCH FROM exit_time)::bigint,  exit_price::double precision,
+               pnl_pct::double precision
+        FROM {table}
+        WHERE symbol = ANY(%(syms)s)
+          AND entry_time < %(to_ts)s AND exit_time >= %(from_ts)s
+          {"AND strategy = %(strategy)s" if strategy else ""}
+        ORDER BY entry_time LIMIT %(lim)s
+    """
+    args = {"syms": _symbol_forms(sym), "from_ts": _ts(from_s), "to_ts": _ts(to_s), "lim": int(limit)}
+    if strategy:
+        args["strategy"] = strategy
+    out = []
+    for strat, side, et, ep, xt, xp, pnl in _query(sql, args):
+        long = not (side or "").upper().startswith("S")
+        pnl = float(pnl or 0.0)
+        out.append({"kind": "backtest_entry", "time": int(et), "side": "BUY" if long else "SELL",
+                    "price": float(ep), "strategy": strat, "pnl_pct": pnl,
+                    "text": f"{strat} {'long' if long else 'short'} entry @ {float(ep):g}"})
+        if xt is not None and xp is not None:
+            out.append({"kind": "backtest_exit", "time": int(xt), "side": "SELL" if long else "BUY",
+                        "price": float(xp), "strategy": strat, "pnl_pct": pnl,
+                        "text": f"{strat} exit @ {float(xp):g} · {pnl:+.2f}%"})
+    return out
+
+
+def backtest_strategies(table_key):
+    """Distinct strategy labels in a backtest table, for a picker."""
+    table = BACKTEST_TABLES.get(table_key)
+    if not table:
+        return []
+    return [r[0] for r in _query(f"SELECT DISTINCT strategy FROM {table} ORDER BY 1", {}) if r[0]]

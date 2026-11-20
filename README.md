@@ -95,6 +95,31 @@ export CAIT_DB_PASSWORD_FILE=/run/secrets/tradex_ro_password
 python hub/server.py
 ```
 
+### Overlays
+
+On a `CAIT_*` ticker the **Lightweight Charts** engine can draw two overlays, kept
+visually distinct because they are different claims:
+
+| Overlay | Source | Drawn as |
+|---|---|---|
+| `orders` | `bb8_orders` — what a venue actually did | arrows; unfilled statuses faint |
+| `backtest` | a `*_backtest_trades` table — what a model says *would* have happened | circles (entry) / squares (exit), coloured by P&L |
+
+```js
+labChart.setOverlay("orders");
+labChart.setOverlay("backtest", { table: "donchian", strategy: "Donchian_LongOnly" });
+labChart.setOverlay("off");
+```
+
+Markers landing on the same bar and side are collapsed into one, labelled with the
+count and average price — a day with 400 fills would otherwise draw 400 overlapping
+arrows. A dense window is **evenly sampled** across its whole range rather than
+truncated to its oldest rows, and the response says so (`sampled`, `total`) so the
+chart never implies it is showing everything.
+
+`GET /api/cait/markers?symbol=&from=&to=&kind=orders|backtest[&table=&strategy=&status=]`
+and `GET /api/cait/backtests?table=` back these.
+
 All access is read-only: the pool sets `default_transaction_read_only=on` and a 30 s
 `statement_timeout`, and the feed never writes. Point it at a role with `SELECT` and nothing
 else. Other settings: `CAIT_DB_PORT` (5432), `CAIT_DB_NAME` (crypto_ai_prod), `CAIT_DB_SSLMODE`,

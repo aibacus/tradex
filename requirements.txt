@@ -9,3 +9,5 @@ pyarrow>=15
 psycopg2-binary>=2.9
 # CAIT live tail (CAIT_KAFKA_BOOTSTRAP set): the forming bar from Kafka.
 confluent-kafka>=2.5
+# CAIT live book (CAIT_REDIS_HOST set): the ladder from Redis for CAITB_* tickers.
+redis>=5

@@ -158,6 +158,19 @@ partition and joins no consumer group, so a chart can never accrue lag, appear i
 consumer-group monitoring, or become the thing that looks healthy while consuming
 nothing.
 
+A `CAITB_<venue>_<BASE>` series **is** the book mid, so with `CAIT_REDIS_HOST` set
+it reads the live ladder at `{venue}:orderbook:{BASE}` (~100ms flush) instead of
+the 5-second database sample in `orderbook_features`:
+
+```bash
+export CAIT_REDIS_HOST=<host>
+export CAIT_REDIS_PASSWORD_FILE=/run/secrets/redis_password
+```
+
+A missing key means **no book** — the collector is down or the 60s TTL lapsed.
+Nothing is emitted in that case: carrying the last mid forward would draw a flat
+line that reads as a quiet market rather than a dead feed.
+
 `GET /api/cait/tail` answers "is the live feed actually live?" — messages seen,
 messages matched, subscribed symbols, last error.
 

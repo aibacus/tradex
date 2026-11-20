@@ -606,3 +606,91 @@ def _bar_from_message(d):
 
 
 TAIL = _Tail()
+
+
+# --------------------------------------------------------------------------
+# Live book: the ladder from Redis, not a database copy of it
+# --------------------------------------------------------------------------
+# The multi-venue collector writes `{venue}:orderbook:{BASE}` with a ~100ms
+# coalescing flush and a 60s TTL. `orderbook_features` is a 5-second sample of
+# that same book landed into Postgres, so a CAITB_* chart reading the database
+# was looking at a stale copy of something sitting in memory.
+#
+# Redis has no push for these keys (the collector SETEXes them), so this polls —
+# but a Redis GET is sub-millisecond, which is a different thing entirely from
+# polling a 165M-row hypertable.
+#
+# A missing key means the collector is not running or the TTL lapsed. It is NOT
+# "spread zero" or "mid unchanged": the caller must treat None as no book, which
+# is the same rule the CAIT codebase applies to its own LOB reads.
+REDIS_URL_HOST = os.getenv("CAIT_REDIS_HOST", "").strip()
+REDIS_PORT = int(os.getenv("CAIT_REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("CAIT_REDIS_DB", "0"))
+# How often the ladder is re-read. The collector flushes about every 100ms;
+# faster than that buys nothing but load.
+BOOK_POLL_S = float(os.getenv("CAIT_BOOK_POLL_SEC", "0.5"))
+
+_redis_client = None
+_redis_lock = threading.Lock()
+
+
+def _redis_password():
+    p = os.getenv("CAIT_REDIS_PASSWORD")
+    if p:
+        return p
+    f = os.getenv("CAIT_REDIS_PASSWORD_FILE")
+    if f:
+        try:
+            with open(f, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+    return None
+
+
+def redis_enabled():
+    return bool(REDIS_URL_HOST)
+
+
+def _redis():
+    global _redis_client
+    if _redis_client is None:
+        with _redis_lock:
+            if _redis_client is None:
+                import redis as _r
+                _redis_client = _r.Redis(
+                    host=REDIS_URL_HOST, port=REDIS_PORT, db=REDIS_DB,
+                    password=_redis_password(), socket_timeout=2,
+                    socket_connect_timeout=3, decode_responses=True,
+                )
+    return _redis_client
+
+
+def book_mid(venue, base):
+    """(mid, ts_epoch) from the live ladder, or (None, None) when there is no book.
+
+    None means no book — never zero, never a stale carry-forward.
+    """
+    try:
+        raw = _redis().get(f"{venue}:orderbook:{base.upper()}")
+    except Exception:
+        return None, None
+    if not raw:
+        return None, None
+    try:
+        d = json.loads(raw)
+        bid = float(d["bids"][0]["price"])
+        ask = float(d["asks"][0]["price"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None, None
+    if not (bid > 0 and ask > 0):
+        return None, None
+    ts = None
+    t = d.get("timestamp")
+    if t:
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(str(t).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = None
+    return (bid + ask) / 2.0, (ts or time.time())

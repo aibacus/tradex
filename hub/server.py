@@ -368,6 +368,31 @@ async def stream_cait(ws, symbol, tf):
     if live:
         cait_feed.TAIL.subscribe(sym, on_bar)
 
+    # A CAITB_* series IS the book mid, and the book lives in Redis with a ~100ms
+    # flush. Reading orderbook_features for it meant charting a 5-second-old
+    # database sample of something in memory. Redis has no push for these keys,
+    # so this polls — but a GET is sub-millisecond, unlike the hypertable.
+    book_task = None
+    if kind == "book" and cait_feed.redis_enabled():
+        async def book_loop():
+            while True:
+                try:
+                    mid, ts = await asyncio.to_thread(cait_feed.book_mid, _venue, sym)
+                except Exception:
+                    mid, ts = None, None
+                # No key means no book (collector down, or TTL lapsed). Carrying
+                # the last mid forward would draw a flat line that looks like a
+                # quiet market instead of a dead feed, so nothing is emitted.
+                if mid:
+                    t = int(ts)
+                    try:
+                        q.put_nowait({"time": t - t % 60, "open": mid, "high": mid,
+                                      "low": mid, "close": mid, "volume": 0.0})
+                    except asyncio.QueueFull:
+                        pass
+                await asyncio.sleep(cait_feed.BOOK_POLL_S)
+        book_task = asyncio.create_task(book_loop())
+
     # base: the last bar as the database gave it. minute_vol: per-minute volume
     # seen on the tail SINCE that snapshot, keyed by minute so a repeated update
     # of the same forming minute replaces rather than double-counts.
@@ -455,6 +480,8 @@ async def stream_cait(ws, symbol, tf):
     finally:
         if live:
             cait_feed.TAIL.unsubscribe(sym, on_bar)
+        if book_task:
+            book_task.cancel()
 
 # ---------------- Binance (no login) ----------------
 async def stream_binance(ws, symbol, tf):
@@ -1133,11 +1160,19 @@ class LabHandler(SimpleHTTPRequestHandler):
             # "Is the live feed actually live?" — the question an idle-looking
             # chart should be able to answer without reading logs.
             t = cait_feed.TAIL
+            book = {"enabled": cait_feed.redis_enabled(), "poll_sec": cait_feed.BOOK_POLL_S}
+            if cait_feed.redis_enabled():
+                # Probe one venue so "configured" and "actually serving a book"
+                # are not confused for each other.
+                mid, ts = cait_feed.book_mid(q_venue := "kraken", "BTC")
+                book.update(probe=f"{q_venue}:orderbook:BTC", mid=mid,
+                            age_sec=round(time.time() - ts, 2) if ts else None)
             return self._json({"enabled": cait_feed.kafka_enabled(), "topic": cait_feed.KAFKA_TOPIC,
                                "raw": t.raw, "matched": t.messages,
                                "symbols_subscribed": sorted(t._subs),
                                "error": t.last_error,
-                               "reconcile_sec": cait_feed.RECONCILE_S}, 200)
+                               "reconcile_sec": cait_feed.RECONCILE_S,
+                               "book": book}, 200)
         if self.path.startswith("/api/cait/backtests"):
             try:
                 return self._json({"tables": sorted(cait_feed.BACKTEST_TABLES),

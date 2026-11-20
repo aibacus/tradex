@@ -71,6 +71,35 @@ and set `LOCAL_MT5=1` in `.env`. A "Local MT5" feed appears.
 2. On your PC: add the server to `~/.ssh/config` (key login) and set `REMOTE_MT5_SSH_HOST=<alias>` in `.env`.
 3. Restart the hub. It opens the SSH tunnel itself and reconnects if the link drops. A "Remote MT5" feed appears.
 
+## CAIT feed (this fork)
+
+This fork adds a fifth feed, `cait`: candles read straight from a
+[CAIT](https://github.com/aibacus) TimescaleDB rather than a public exchange API. It is **off
+unless `CAIT_DB_HOST` is set**, so the upstream behaviour is unchanged by default.
+
+Two ticker shapes, because they are two different measurements:
+
+| Ticker | Source | Volume |
+|---|---|---|
+| `CAIT_<SYMBOL>` | `crypto_ohlcvt` traded candles | real |
+| `CAITB_<venue>_<BASE>` | `(best_bid+best_ask)/2` from `orderbook_features` | none — these are quotes |
+
+Why read a database instead of the exchange: Kraken's public OHLC endpoint returns "up to 720
+of the most recent entries (older data cannot be retrieved)", while the database holds years,
+and it is the same data the strategies were tested against.
+
+```bash
+export CAIT_DB_HOST=<tailscale-ip>      # required; the feed stays off without it
+export CAIT_DB_USER=tradex_ro           # a SELECT-only role
+export CAIT_DB_PASSWORD_FILE=/run/secrets/tradex_ro_password
+python hub/server.py
+```
+
+All access is read-only: the pool sets `default_transaction_read_only=on` and a 30 s
+`statement_timeout`, and the feed never writes. Point it at a role with `SELECT` and nothing
+else. Other settings: `CAIT_DB_PORT` (5432), `CAIT_DB_NAME` (crypto_ai_prod), `CAIT_DB_SSLMODE`,
+`CAIT_BOOK_VENUES`, `CAIT_POLL_SEC`.
+
 ## Let your AI agent set it up
 
 [AGENTS.md](AGENTS.md) is written for coding agents (Claude Code, Codex, Cursor and similar). It gives the exact

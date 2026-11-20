@@ -36,7 +36,7 @@ def load_env(path):
 
 load_env(os.path.join(HERE, "..", ".env"))
 load_env(os.path.join(HERE, ".env"))
-import logbus, feedlog
+import logbus, feedlog, cait_feed
 
 HTTP_PORT = int(os.environ.get("HUB_HTTP_PORT", "8770"))
 WS_PORT = int(os.environ.get("HUB_WS_PORT", "8765"))
@@ -324,6 +324,34 @@ async def stream_arm(ws, symbol, tf):
             conn = None
             await ws.send(json.dumps({"type": "status", "msg": f"Remote MT5 reconnecting: {e}"}))
             await asyncio.sleep(3)
+
+# ---------------- CAIT (private TimescaleDB; off unless CAIT_DB_HOST is set) ----------------
+def cait_history(symbol, tf, limit=HISTORY, to_ms=None):
+    return cait_feed.history(symbol, tf, int(limit or HISTORY), to_ms)
+
+async def stream_cait(ws, symbol, tf):
+    """History, then poll the newest bar. The database is the live edge here: there is
+    no exchange socket to attach to, and a poll keeps this strictly read-only."""
+    try:
+        bars = await asyncio.to_thread(cait_history, symbol, tf)
+    except Exception as e:
+        await ws.send(json.dumps({"type": "error", "msg": f"CAIT history failed: {e}"})); return
+    await ws.send(json.dumps({"type": "history", "bars": bars, "source": "cait", "symbol": symbol, "tf": tf}))
+    last = dict(bars[-1]) if bars else None
+    while True:
+        await asyncio.sleep(cait_feed.POLL_S)
+        try:
+            tail = await asyncio.to_thread(cait_history, symbol, tf, 2)
+        except websockets.ConnectionClosed:
+            return
+        except Exception as e:
+            await ws.send(json.dumps({"type": "status", "msg": f"CAIT reconnecting: {e}"}))
+            continue
+        for b in tail:
+            # Emit a bar when it is new, or when the forming one moved.
+            if last is None or b["time"] > last["time"] or (b["time"] == last["time"] and b != last):
+                last = dict(b)
+                await ws.send(json.dumps({"type": "bar", "bar": b, "sent": int(time.time() * 1000)}))
 
 # ---------------- Binance (no login) ----------------
 async def stream_binance(ws, symbol, tf):
@@ -695,7 +723,7 @@ async def handler(ws):
             if tf not in TF_SEC:
                 await ws.send(json.dumps({"type": "error", "msg": f"Unknown timeframe {tf}"}))
                 continue
-            fn = {"mt5": stream_mt5, "deriv": stream_deriv, "arm": stream_arm, "bybit": stream_bybit}.get(src, stream_binance)
+            fn = {"mt5": stream_mt5, "deriv": stream_deriv, "arm": stream_arm, "bybit": stream_bybit, "cait": stream_cait}.get(src, stream_binance)
             task = feedlog.start_stream(fn, ws, src if fn is not stream_binance else "binance", sym, tf)
     except websockets.ConnectionClosed:
         pass
@@ -784,7 +812,7 @@ def mt5_history(symbol, tf, limit=HISTORY, to_ms=None):
 # ---------------- Instrument map (TradeX: switch broker, stay on the same instrument) ----------------
 # One instrument = the same underlying market at several brokers. Only exact matches are joined:
 # gold tokens (PAXG, XAUT) are NOT gold spot, so they stay separate instruments.
-BROKERS = [("deriv", "Deriv"), ("bybit", "Bybit"), ("binance", "Binance")] + ([("arm", "Remote MT5")] if REMOTE_ON else []) + ([("mt5", "Local MT5")] if LOCAL_MT5 else [])
+BROKERS = [("deriv", "Deriv"), ("bybit", "Bybit"), ("binance", "Binance")] + ([("cait", "CAIT")] if cait_feed.enabled() else []) + ([("arm", "Remote MT5")] if REMOTE_ON else []) + ([("mt5", "Local MT5")] if LOCAL_MT5 else [])
 DERIV_INDEX = {"OTC_NDX": "USTEC", "OTC_DJI": "US30", "OTC_SPC": "US500", "OTC_FTSE": "UK100", "OTC_GDAXI": "DE30",
                "OTC_FCHI": "FR40", "OTC_N225": "JP225", "OTC_HSI": "HK50", "OTC_AS51": "AUS200", "OTC_SX5E": "STOXX50"}
 def variant_rank(label):
@@ -809,6 +837,8 @@ def instrument_key(s):
         return t, None
     if src == "binance":
         return t, None
+    if src == "cait":
+        return cait_feed.instrument_base(t)
     if src == "bybit":
         cat, sym, kind = bybit_parse(t)
         if "-" in sym and kind != "trade":
@@ -830,7 +860,7 @@ def instrument_key(s):
     return None, None
 
 def build_instruments():
-    syms = arm_symbols_cache + deriv_symbols_cache + bybit_symbols_cache + mt5_symbol_list()[0] + \
+    syms = arm_symbols_cache + deriv_symbols_cache + bybit_symbols_cache + cait_feed.symbols() + mt5_symbol_list()[0] + \
         [{"ticker": t, "name": n, "source": "binance", "group": "crypto"} for t, n in CRYPTO]
     if _instr_cache["n"] == len(syms):
         return _instr_cache["data"]
@@ -904,7 +934,7 @@ class LabHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/symbols"):
             crypto = [{"ticker": t, "name": n, "source": "binance", "group": "crypto"} for t, n in CRYPTO]
             mt5_list, err = mt5_symbol_list()
-            return self._json({"symbols": arm_symbols_cache + bybit_symbols_cache + deriv_symbols_cache + mt5_list + crypto, "mt5": err or "ok", "arm": arm_status["msg"],
+            return self._json({"symbols": arm_symbols_cache + bybit_symbols_cache + deriv_symbols_cache + cait_feed.symbols() + mt5_list + crypto, "mt5": err or "ok", "arm": arm_status["msg"],
                                "deriv": len(deriv_symbols_cache), "bybit": len(bybit_symbols_cache), "ws_port": WS_PORT}, 200)
         if self.path.startswith("/api/restart"):
             return self._json(restart_state, 200)
@@ -924,7 +954,7 @@ class LabHandler(SimpleHTTPRequestHandler):
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             try:
                 src = q.get("feed") or "binance"
-                hist = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history}.get(src, binance_history)
+                hist = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history, "cait": cait_history}.get(src, binance_history)
                 now = int(time.time())
                 rows, info = orderflow_api.delta(q.get("symbol", "frxXAUUSD"), q.get("tf", "M5"), int(q.get("from", now - 86400)),
                                                  int(q.get("to", now)), q.get("source", "auto"), history=hist)
@@ -938,7 +968,7 @@ class LabHandler(SimpleHTTPRequestHandler):
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             try:
                 src = q.get("feed") or "binance"
-                hist = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history}.get(src, binance_history)
+                hist = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history, "cait": cait_history}.get(src, binance_history)
                 now = int(time.time()); tf = q.get("tf", "M5"); sym = q.get("symbol", "frxXAUUSD")
                 a, b = int(q.get("from", now - 3 * 3600)), int(q.get("to", now))
                 sec = orderflow_api.TF_SEC[tf]
@@ -956,7 +986,7 @@ class LabHandler(SimpleHTTPRequestHandler):
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             try:
                 src = q.get("feed") or "binance"
-                hist = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history}.get(src, binance_history)
+                hist = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history, "cait": cait_history}.get(src, binance_history)
                 now = int(time.time())
                 sess, info = orderflow_api.profile(q.get("symbol", "frxXAUUSD"), q.get("tf", "M5"), int(q.get("from", now - 86400)),
                                                    int(q.get("to", now)), q.get("source", "auto"), history=hist,
@@ -973,7 +1003,7 @@ class LabHandler(SimpleHTTPRequestHandler):
             return super().do_GET()
         q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
         try:
-            fn = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history}.get(q.get("source"), binance_history)
+            fn = {"mt5": mt5_history, "deriv": deriv_history, "arm": arm_history, "bybit": bybit_history, "cait": cait_history}.get(q.get("source"), binance_history)
             bars = fn(q.get("symbol", "BTCUSD"), q.get("tf", "M1"), q.get("limit", HISTORY), q.get("to"))
             body, code = json.dumps(bars).encode(), 200
             feedlog.http_bars(q.get("source"), q.get("symbol"), q.get("tf"), n=len(bars))
@@ -1060,6 +1090,8 @@ async def main():
     print(f"Clock offset vs time.windows.com: {measure_clock_offset():+.0f} ms (corrected in lag numbers)", flush=True)
     threading.Thread(target=deriv_symbols_loop, daemon=True).start()
     threading.Thread(target=bybit_symbols_loop, daemon=True).start()
+    if cait_feed.enabled():
+        threading.Thread(target=cait_feed.symbols_loop, daemon=True).start()
     feedlog.start(FEED_HEALTH, ARM_PORT if REMOTE_ON else None, feed_status)
     print(f"TradeX: open http://localhost:{HTTP_PORT}/hub.html  (data on ws://localhost:{WS_PORT})", flush=True)
     async with websockets.serve(handler, "127.0.0.1", WS_PORT, max_size=None):

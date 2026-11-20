@@ -105,6 +105,17 @@ visually distinct because they are different claims:
 | `orders` | `bb8_orders` — what a venue actually did | arrows; unfilled statuses faint |
 | `backtest` | a `*_backtest_trades` table — what a model says *would* have happened | circles (entry) / squares (exit), coloured by P&L |
 
+Pick them from the toolbar: an **overlay dropdown** appears on the Lightweight
+engine whenever the chart is on a `CAIT_*` ticker (and disappears otherwise, since
+it has nothing to draw). Choosing *Backtest trades* reveals a table picker and a
+strategy picker, both populated from the database.
+
+A note beside the dropdown says how many markers are drawn, and turns amber when
+the set was sampled — e.g. `2000 of 12173 sampled, grouped to 38`, so a thinned
+view never passes for the whole one.
+
+The same thing is scriptable:
+
 ```js
 labChart.setOverlay("orders");
 labChart.setOverlay("backtest", { table: "donchian", strategy: "Donchian_LongOnly" });

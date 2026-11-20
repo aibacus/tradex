@@ -9,6 +9,10 @@
   #bar label{display:flex;gap:4px;align-items:center}
   #chart{position:absolute;left:0;right:0;bottom:0}
   #title{font-weight:600;margin-right:8px}
+  #bar .note{color:#8fa3b4;font-size:12px;margin-left:2px}
+  #bar .note.warn{color:#d9a441}
+  #ovgroup{display:none;gap:6px;align-items:center}
+  #ovgroup.show{display:flex}
 </style></head><body>
 <div id="bar">
   <span id="title">Lightweight Charts 5.2.1</span>
@@ -22,6 +26,17 @@
   <label><input type="checkbox" id="ema" checked>EMA 20/50/200</label>
   <label><input type="checkbox" id="vol" checked>Volume</label>
   <label><input type="checkbox" id="rsi" checked>RSI 14</label>
+  <span class="sep" id="ovsep"></span>
+  <span id="ovgroup">
+    <select id="ovmode" title="Overlay real orders or a backtest's trades on the candles">
+      <option value="off">No overlay</option>
+      <option value="orders">Orders (real)</option>
+      <option value="backtest">Backtest trades</option>
+    </select>
+    <select id="ovtable" title="Which backtest table to read"></select>
+    <select id="ovstrategy" title="Strategy label within that table"></select>
+    <span id="ovinfo" class="note"></span>
+  </span>
   <span class="sep"></span>
   <button id="auto">Code trendline</button><button id="clear">Clear drawings</button>
 </div>
@@ -149,9 +164,6 @@ async function paintOverlay() {
   if (data.error || !data.markers) return;
   // The server thins a dense window rather than returning only its oldest slice.
   // Say so on the chart: markers that are a sample must not read as the whole set.
-  if (data.sampled) {
-    console.info(`CAIT overlay: showing ${data.markers.length} of ${data.total} — evenly sampled across the window.`);
-  }
   lastOverlayInfo = { shown: data.markers.length, total: data.total || data.markers.length, sampled: !!data.sampled };
   // Snap each marker to the bar that contains it: Lightweight anchors markers to
   // a bar time, and a raw timestamp between bars is dropped silently.
@@ -194,7 +206,61 @@ async function paintOverlay() {
   out.sort((a, b) => a.time - b.time);
   if (!markersApi) markersApi = LC.createSeriesMarkers(price, out);
   else markersApi.setMarkers(out);
+  showOverlayInfo(out.length);
 }
+
+// ---- toolbar wiring --------------------------------------------------------
+const ovGroup = document.getElementById("ovgroup"), ovMode = document.getElementById("ovmode"),
+      ovTable = document.getElementById("ovtable"), ovStrategy = document.getElementById("ovstrategy"),
+      ovInfo = document.getElementById("ovinfo"), ovSep = document.getElementById("ovsep");
+
+function showOverlayInfo(drawn) {
+  const i = lastOverlayInfo;
+  if (overlayMode === "off" || !i) { ovInfo.textContent = ""; ovInfo.className = "note"; return; }
+  if (!i.total) { ovInfo.textContent = "none in view"; ovInfo.className = "note"; return; }
+  // Say when the drawn set is not the whole set. A chart that quietly shows a
+  // subset is a chart that misleads about how much happened.
+  const grouped = drawn < i.shown ? `, grouped to ${drawn}` : "";
+  ovInfo.textContent = i.sampled
+    ? `${i.shown} of ${i.total} sampled${grouped}`
+    : `${i.total} marker${i.total === 1 ? "" : "s"}${grouped}`;
+  ovInfo.className = i.sampled ? "note warn" : "note";
+}
+
+async function loadStrategies() {
+  ovStrategy.innerHTML = "";
+  ovStrategy.add(new Option("All strategies", ""));
+  try {
+    const r = await fetch("/api/cait/backtests?table=" + encodeURIComponent(ovTable.value)).then((x) => x.json());
+    (r.strategies || []).forEach((n) => ovStrategy.add(new Option(n, n)));
+  } catch (e) { /* leave just "All strategies" */ }
+}
+
+async function initOverlayUI() {
+  try {
+    const r = await fetch("/api/cait/backtests").then((x) => x.json());
+    (r.tables || []).forEach((t) => ovTable.add(new Option(t, t)));
+    ovTable.value = overlayTable;
+  } catch (e) { /* CAIT feed off; the group stays hidden anyway */ }
+  await loadStrategies();
+  syncOverlayUI();
+}
+
+function syncOverlayUI() {
+  // The whole group is meaningless off a CAIT ticker, so it disappears rather
+  // than sitting there disabled.
+  const on = overlayAvailable();
+  ovGroup.classList.toggle("show", on);
+  ovSep.style.display = on ? "" : "none";
+  const bt = ovMode.value === "backtest";
+  ovTable.style.display = bt ? "" : "none";
+  ovStrategy.style.display = bt ? "" : "none";
+  if (!on) ovInfo.textContent = "";
+}
+
+ovMode.addEventListener("change", () => { syncOverlayUI(); overlayMode = ovMode.value; paintOverlay(); });
+ovTable.addEventListener("change", async () => { overlayTable = ovTable.value; await loadStrategies(); overlayStrategy = ""; paintOverlay(); });
+ovStrategy.addEventListener("change", () => { overlayStrategy = ovStrategy.value; paintOverlay(); });
 
 let loadGen = 0;
 async function load() {
@@ -205,6 +271,7 @@ async function load() {
   bars = fresh;
   paintAll();
   drawings.clear();
+  syncOverlayUI();
   paintOverlay();
   let lastRepaint = 0;
   stop = LabFeed.live(sym, tf, (b) => {
@@ -272,8 +339,8 @@ function applyTheme() {
   makePrice(); paintAll();
 }
 window.labChart = { name: "lightweight", applyTheme, setMarket: (s, t) => { sym = s; tf = t || tf; if (![...symSel.options].some((o) => o.value === s)) symSel.add(new Option(s, s)); symSel.value = s; markTF(); return load(); }, setTF: (t) => { tf = t; markTF(); return load(); }, addCodeTrendline, drawingCount: () => drawings.drawings().length, barCount: () => bars.length,
-  setOverlay: (mode, opts) => { overlayMode = mode || "off"; if (opts) { if (opts.table) overlayTable = opts.table; overlayStrategy = opts.strategy || ""; } return paintOverlay(); },
+  setOverlay: (mode, opts) => { overlayMode = mode || "off"; if (opts) { if (opts.table) overlayTable = opts.table; overlayStrategy = opts.strategy || ""; } ovMode.value = overlayMode; ovTable.value = overlayTable; syncOverlayUI(); return paintOverlay(); },
   overlay: () => ({ mode: overlayMode, table: overlayTable, strategy: overlayStrategy, available: overlayAvailable(), last: lastOverlayInfo }) };
-makePrice(); markTF(); load();
+makePrice(); markTF(); load(); initOverlayUI();
 </script>
 </body></html>

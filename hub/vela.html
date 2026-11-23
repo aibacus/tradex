@@ -257,7 +257,7 @@ async function ovPaint() {
     const q = new URLSearchParams({ symbol: sym, from, to, kind: ovMode === "orders" ? "orders" : "backtest" });
     if (ovMode === "orders") q.set("status", "filled");
     else { q.set("table", ovTable); if (ovStrategy) q.set("strategy", ovStrategy); }
-    const data = await fetch("/api/cait/markers?" + q).then((r) => r.json());
+    const data = await fetch("/api/cait/markers?" + q, { headers: window.labHeaders() }).then((r) => r.json());
     if (data.error || !data.markers) { ovWhy = "api: " + (data.error || "no markers"); return; }
     ovInfoLast = { shown: data.markers.length, total: data.total || data.markers.length, sampled: !!data.sampled };
 
@@ -314,7 +314,7 @@ async function ovLoadStrategies() {
   const sel = ovEl("ovstrategy"); sel.innerHTML = "";
   sel.add(new Option("All strategies", ""));
   try {
-    const r = await fetch("/api/cait/backtests?table=" + encodeURIComponent(ovTable)).then((x) => x.json());
+    const r = await fetch("/api/cait/backtests?table=" + encodeURIComponent(ovTable), { headers: window.labHeaders() }).then((x) => x.json());
     (r.strategies || []).forEach((n) => sel.add(new Option(n, n)));
   } catch (e) {}
 }
@@ -330,7 +330,7 @@ function ovSync() {
 
 async function ovInit() {
   try {
-    const r = await fetch("/api/cait/backtests").then((x) => x.json());
+    const r = await fetch("/api/cait/backtests", { headers: window.labHeaders() }).then((x) => x.json());
     (r.tables || []).forEach((t) => ovEl("ovtable").add(new Option(t, t)));
     ovEl("ovtable").value = ovTable;
   } catch (e) {}

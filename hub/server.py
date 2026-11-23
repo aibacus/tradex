@@ -18,7 +18,7 @@ Client -> server: {"source": "mt5"|"binance"|"deriv"|"arm"|"bybit", "symbol": "X
 Server -> client: {"type": "history", "bars": [...]}, then {"type": "bar", "bar": {...}, "sent": epoch_ms}
                   {"type": "error", "msg": "..."}
 """
-import asyncio, json, subprocess, threading, time, urllib.request, functools, os, sys
+import asyncio, hmac, json, subprocess, threading, time, urllib.request, functools, os, sys
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import websockets
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +46,33 @@ WS_PORT = int(os.environ.get("HUB_WS_PORT", "8765"))
 # exists for that case and nothing else. Widening it puts an unauthenticated page
 # on whatever interface you name; put it behind a private network, not the internet.
 BIND_HOST = os.environ.get("HUB_BIND", "127.0.0.1").strip() or "127.0.0.1"
+# Shared secret for the CAIT routes. These are a read path into the trading
+# database, so once HUB_BIND is widened past loopback they need more than "only
+# we know the port". Unset = off, which keeps the upstream app's behaviour for
+# anyone running it without CAIT; set it whenever the port is reachable by anyone
+# else. The browser sends it as a header on API calls (so it stays out of HTTP
+# logs) and as a query parameter on the WebSocket handshake, where a browser
+# cannot set headers.
+def _token_from_env():
+    t = os.environ.get("CAIT_API_TOKEN", "").strip()
+    if t:
+        return t
+    f = os.environ.get("CAIT_API_TOKEN_FILE", "").strip()
+    if f:
+        try:
+            with open(f, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+API_TOKEN = _token_from_env()
+# Origins allowed to open the WebSocket. A WebSocket is NOT subject to the
+# same-origin policy: without this check any page the operator visits can connect
+# to localhost:8765 and stream from this process. Browsers always send Origin on
+# a WebSocket handshake, so a request without one is a non-browser client.
+ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("HUB_ALLOWED_ORIGINS", "").split(",") if o.strip()}
 LOCAL_MT5 = os.environ.get("LOCAL_MT5", "0") == "1"
 MT5_TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe")
 REMOTE_SSH_HOST = os.environ.get("REMOTE_MT5_SSH_HOST", "").strip()   # an alias from your ~/.ssh/config; empty = off
@@ -867,8 +894,37 @@ async def stream_deriv(ws, symbol, tf):
             await ws.send(json.dumps({"type": "status", "msg": f"Deriv reconnecting: {e}"}))
         await asyncio.sleep(60)
 
+# ---------------- Access control ----------------
+def _origin_ok(origin):
+    """Default allowlist is this server's own pages; HUB_ALLOWED_ORIGINS replaces it."""
+    if not origin:
+        return True  # not a browser; the token is what gates these clients
+    allowed = ALLOWED_ORIGINS or {f"http://localhost:{HTTP_PORT}", f"http://127.0.0.1:{HTTP_PORT}"}
+    return origin in allowed
+
+
+def _token_ok(given):
+    if not API_TOKEN:
+        return True
+    return bool(given) and hmac.compare_digest(given, API_TOKEN)
+
+
 # ---------------- WebSocket hub ----------------
 async def handler(ws):
+    req = getattr(ws, "request", None)
+    origin = (req.headers.get("Origin", "") if req is not None else "") or ""
+    if not _origin_ok(origin):
+        logbus.ev("server", "warn", f"websocket refused: origin {origin!r}", every=30)
+        await ws.close(1008, "forbidden origin")
+        return
+    if API_TOKEN:
+        from urllib.parse import urlparse as _up, parse_qs as _pq
+        path = getattr(req, "path", "") if req is not None else ""
+        tok = (_pq(_up(path).query).get("token") or [""])[0]
+        if not _token_ok(tok):
+            logbus.ev("server", "warn", "websocket refused: bad or missing token", every=30)
+            await ws.close(1008, "unauthorized")
+            return
     task = None
     try:
         async for msg in ws:
@@ -1087,6 +1143,11 @@ class LabHandler(SimpleHTTPRequestHandler):
     """Static files plus GET /api/bars?symbol=&tf=&limit=&to=<ms>&source=binance|mt5 and GET /api/symbols."""
     def do_GET(self):
         from urllib.parse import urlparse, parse_qs
+        if API_TOKEN and self._touches_cait():
+            given = self.headers.get("X-CAIT-Token", "") or \
+                (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+            if not _token_ok(given):
+                return self._json({"error": "unauthorized"}, 401)
         if self.path.startswith("/api/symbols"):
             crypto = [{"ticker": t, "name": n, "source": "binance", "group": "crypto"} for t, n in CRYPTO]
             mt5_list, err = mt5_symbol_list()
@@ -1252,6 +1313,18 @@ class LabHandler(SimpleHTTPRequestHandler):
                 threading.Thread(target=arm_restart, daemon=True).start()
             return self._json(restart_state, 200)
         return self._json({"error": "not found"}, 404)
+
+    def _touches_cait(self):
+        """Any request that would read the trading database.
+
+        Not just /api/cait/*: /api/bars and the orderflow routes reach the same
+        tables when their source parameter names the cait feed.
+        """
+        from urllib.parse import urlparse, parse_qs
+        if self.path.startswith("/api/cait/"):
+            return True
+        q = parse_qs(urlparse(self.path).query)
+        return "cait" in (q.get("source", []) + q.get("feed", []))
 
     def _raw(self, code, raw):
         self.send_response(code)

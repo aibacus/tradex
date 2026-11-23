@@ -159,7 +159,7 @@ async function paintOverlay() {
   if (overlayMode === "orders") q.set("status", "filled");
   else { q.set("table", overlayTable); if (overlayStrategy) q.set("strategy", overlayStrategy); }
   let data;
-  try { data = await fetch("/api/cait/markers?" + q).then((r) => r.json()); }
+  try { data = await fetch("/api/cait/markers?" + q, { headers: window.labHeaders() }).then((r) => r.json()); }
   catch (e) { return; }
   if (data.error || !data.markers) return;
   // The server thins a dense window rather than returning only its oldest slice.
@@ -231,14 +231,14 @@ async function loadStrategies() {
   ovStrategy.innerHTML = "";
   ovStrategy.add(new Option("All strategies", ""));
   try {
-    const r = await fetch("/api/cait/backtests?table=" + encodeURIComponent(ovTable.value)).then((x) => x.json());
+    const r = await fetch("/api/cait/backtests?table=" + encodeURIComponent(ovTable.value), { headers: window.labHeaders() }).then((x) => x.json());
     (r.strategies || []).forEach((n) => ovStrategy.add(new Option(n, n)));
   } catch (e) { /* leave just "All strategies" */ }
 }
 
 async function initOverlayUI() {
   try {
-    const r = await fetch("/api/cait/backtests").then((x) => x.json());
+    const r = await fetch("/api/cait/backtests", { headers: window.labHeaders() }).then((x) => x.json());
     (r.tables || []).forEach((t) => ovTable.add(new Option(t, t)));
     ovTable.value = overlayTable;
   } catch (e) { /* CAIT feed off; the group stays hidden anyway */ }

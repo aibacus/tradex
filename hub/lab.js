@@ -18,11 +18,31 @@ if (LabEmbedded) {
   ].join(" ");
   document.head.appendChild(st);
 }
+// Access token for the CAIT routes, when the server is running with one
+// (CAIT_API_TOKEN). Supplied once as ?token=... on any chart page and kept in
+// this origin's localStorage afterwards, so it is not retyped and no other site
+// can read it. Empty when the server has no token set, which is the default.
+window.LabToken = (() => {
+  const KEY = "cait_token";
+  let t = "";
+  try { t = new URLSearchParams(location.search).get("token") || ""; } catch (e) {}
+  try {
+    if (t) localStorage.setItem(KEY, t);
+    else t = localStorage.getItem(KEY) || "";
+  } catch (e) {}
+  return t;
+})();
+// Header, not a query parameter: a token in a URL lands in every proxy and
+// access log it passes through.
+window.labHeaders = () => (window.LabToken ? { "X-CAIT-Token": window.LabToken } : {});
+// A browser cannot set headers on a WebSocket handshake, so that one URL carries it.
+window.labWsToken = () => (window.LabToken ? "?token=" + encodeURIComponent(window.LabToken) : "");
+
 window.LabFeed = (() => {
   // Leave a 20 px bar at the bottom for the status strip, so it never covers the chart (standalone pages only).
   const chartBox = document.getElementById("chart");
   if (chartBox && !LabEmbedded) chartBox.style.bottom = "20px";
-  const wsUrl = () => `ws://${location.hostname || "localhost"}:${window.LabWsPort || 8765}`;
+  const wsUrl = () => `ws://${location.hostname || "localhost"}:${window.LabWsPort || 8765}` + window.labWsToken();
   const stats = { updates: 0, delays: [], exch: [], srcLag: [], lastAt: 0, firstBarAt: 0, errors: [], status: "" };
   window.labStats = stats;
 
@@ -31,7 +51,7 @@ window.LabFeed = (() => {
     const u = `/api/bars?symbol=${encodeURIComponent(symbol)}&tf=${tf}&limit=${limit}&source=${source}` + (toMs ? `&to=${Math.floor(toMs)}` : "");
     const say = (extra) => { if (window.LabEmbedded) setTimeout(() => window.parent.postMessage({ evt: "loaded", symbol, tf, ...extra }, location.origin), 120); };
     try {
-      const r = await fetch(u);
+      const r = await fetch(u, { headers: window.labHeaders() });
       const j = await r.json();
       if (!Array.isArray(j)) throw new Error(j.error || "history failed");
       say({ bars: j.length });  // TradeX lifts its "Loading" cover only after the new ticker's candles arrived

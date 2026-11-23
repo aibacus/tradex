@@ -83,8 +83,22 @@ def enabled():
     return bool(HOST) and psycopg2 is not None
 
 
+# Pool sizing. psycopg2's pool RAISES when it is empty rather than waiting, and
+# asyncio.to_thread is not cancellable: a chart that switches symbols leaves its
+# previous query running and holding a connection until the statement timeout.
+# So the number of connections is not "one per chart" but "one per in-flight
+# query", and a burst of tab switches can outrun the charts that are open. The
+# semaphore below makes a caller WAIT for a slot instead of failing the request,
+# and the default is raised to a size a handful of charts cannot exhaust.
+POOL_MAX = max(4, int(os.getenv("CAIT_DB_POOL_MAX", "16")))
+# Longer than the 30s statement_timeout would just queue behind a doomed query.
+POOL_WAIT_S = float(os.getenv("CAIT_DB_POOL_WAIT_SEC", "20"))
+
 _pool = None
 _pool_lock = threading.Lock()
+# Guards getconn so the pool is never actually asked for a connection it has not
+# got; psycopg2 has no blocking acquire of its own.
+_pool_slots = threading.BoundedSemaphore(POOL_MAX)
 
 
 def _get_pool():
@@ -93,7 +107,7 @@ def _get_pool():
         with _pool_lock:
             if _pool is None:
                 _pool = _pgpool.ThreadedConnectionPool(
-                    1, int(os.getenv("CAIT_DB_POOL_MAX", "6")),
+                    1, POOL_MAX,
                     host=HOST, port=PORT, dbname=DBNAME, user=USER,
                     password=_password(), sslmode=SSLMODE,
                     connect_timeout=10,
@@ -108,7 +122,18 @@ def _get_pool():
 
 def _query(sql, args):
     pool = _get_pool()
-    conn = pool.getconn()
+    if not _pool_slots.acquire(timeout=POOL_WAIT_S):
+        # Surfaced as a 502 on the API rather than a traceback: the database is
+        # fine, this process is simply running more queries than it has room for.
+        raise RuntimeError(
+            f"CAIT database pool exhausted: {POOL_MAX} connections all busy for "
+            f"{POOL_WAIT_S:.0f}s. Raise CAIT_DB_POOL_MAX."
+        )
+    try:
+        conn = pool.getconn()
+    except Exception:
+        _pool_slots.release()
+        raise
     try:
         with conn.cursor() as cur:
             cur.execute(sql, args)
@@ -122,7 +147,10 @@ def _query(sql, args):
             pass
         raise
     finally:
-        pool.putconn(conn)
+        try:
+            pool.putconn(conn)
+        finally:
+            _pool_slots.release()
 
 
 # --------------------------------------------------------------------------
